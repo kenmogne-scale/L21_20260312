@@ -25,7 +25,7 @@ function normalize(text: string) {
     .toLocaleLowerCase('de-DE')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[!?.,;:()]/g, ' ')
+    .replace(/[!?,;:()]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -86,7 +86,7 @@ function parseDateToken(token: string, referenceDate: Date, startDate?: Date) {
 }
 
 function parseDateRange(text: string, referenceDate: Date) {
-  const rangeMatch = text.match(/\b(?:von|ab)\s+([a-z0-9.\-]+)\s+(?:bis|-\s*)\s+([a-z0-9.\-]+)\b/)
+  const rangeMatch = text.match(/\b(?:von|ab)\s+([a-z0-9.\-]+)\s+(?:bis|-)\s+([a-z0-9.\-]+)\b/)
   if (!rangeMatch) {
     throw new Error('Ich konnte keinen Zeitraum erkennen.')
   }
