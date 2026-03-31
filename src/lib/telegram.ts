@@ -11,14 +11,21 @@ function getTelegramApiUrl(method: string) {
 }
 
 export async function sendTelegramMessage(chatId: number | string, text: string) {
+  const normalizedText = String(text ?? '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\u0000/g, '')
+    .trim()
+    .slice(0, 4000)
+
   const response = await fetch(getTelegramApiUrl('sendMessage'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      chat_id: chatId,
-      text,
+      chat_id: String(chatId),
+      text: normalizedText,
+      disable_web_page_preview: true,
     }),
   })
 

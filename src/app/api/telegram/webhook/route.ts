@@ -55,6 +55,7 @@ export async function POST(req: NextRequest) {
       })
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Unbekannter Fehler'
+      console.error('Telegram webhook inner error:', error)
       await sendTelegramMessage(
         chatId,
         `Ich konnte die Anfrage nicht sicher auswerten. ${message}`,
@@ -64,6 +65,7 @@ export async function POST(req: NextRequest) {
     }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Unbekannter Fehler'
+    console.error('Telegram webhook outer error:', error)
     return NextResponse.json({ ok: false, error: message }, { status: 400 })
   }
 }
