@@ -4,6 +4,7 @@ import { createTelegramAvailabilityMessage } from '@/lib/availability-response'
 import { parseAvailabilityMessage } from '@/lib/availability-message-parser'
 import { checkAvailability, loadLocations } from '@/lib/availability-service'
 import { sendTelegramMessage } from '@/lib/telegram'
+import { handleTelegramWorkflowMessage } from '@/lib/telegram-workflow'
 
 type TelegramWebhookBody = {
   message?: {
@@ -34,6 +35,12 @@ export async function POST(req: NextRequest) {
     }
 
     try {
+      const workflowResult = await handleTelegramWorkflowMessage(chatId, text)
+      if (workflowResult.handled) {
+        await sendTelegramMessage(chatId, workflowResult.reply)
+        return NextResponse.json({ ok: true, workflow: true })
+      }
+
       const locations = await loadLocations()
       const parsedRequest = parseAvailabilityMessage(text, locations)
       const result = await checkAvailability(parsedRequest)

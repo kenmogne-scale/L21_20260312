@@ -26,7 +26,10 @@ async function lexFetch(path: string, options?: RequestInit, retries = 3): Promi
 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
-    throw new Error(`Lexoffice API ${res.status}: ${text}`)
+    const message = text || res.statusText
+    const error = new Error(`Lexoffice API ${res.status}: ${message}`) as Error & { status?: number }
+    error.status = res.status
+    throw error
   }
 
   return res.json()
@@ -235,16 +238,31 @@ export async function getAllContacts(): Promise<LexContact[]> {
 
 export interface CreateInvoicePayload {
   voucherDate: string
-  address: { contactId?: string; name: string; street?: string; zip?: string; city?: string; countryCode?: string }
-  lineItems: Array<{
-    type: 'custom'
+  address: {
+    contactId?: string
     name: string
-    quantity: number
-    unitName: string
-    unitPrice: { currency: 'EUR'; netAmount: number; taxRatePercentage: number }
+    supplement?: string
+    street?: string
+    zip?: string
+    city?: string
+    countryCode?: string
+  }
+  lineItems: Array<{
+    type: 'custom' | 'text'
+    name?: string
+    description?: string
+    quantity?: number
+    unitName?: string
+    unitPrice?: { currency: 'EUR'; netAmount: number; taxRatePercentage: number }
+    discountPercentage?: number
   }>
-  totalPrice: { currency: 'EUR' }
+  totalPrice: { currency: 'EUR'; totalDiscountPercentage?: number }
   taxConditions: { taxType: 'net' | 'gross' | 'vatfree' }
+  shippingConditions: (
+    | { shippingType: 'none' }
+    | { shippingType: 'service'; shippingDate: string }
+    | { shippingType: 'serviceperiod'; shippingDate: string; shippingEndDate: string }
+  )
   paymentConditions?: { paymentTermLabel: string; paymentTermDuration: number }
   title?: string
   introduction?: string
