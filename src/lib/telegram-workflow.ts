@@ -292,12 +292,16 @@ function buildHelpMessage() {
 
 function buildBookingPricePrompt(invoiceForm: InvoiceFormState) {
   const bookingLines = invoiceForm.lines.filter(line => line.kind === 'booking')
-  const priceSummary = bookingLines.map(line => `${line.name}: ${formatMoney(line.unitPriceNet)}`).join(', ')
+  const priceSummary = bookingLines.map(line => {
+    const bedsAllocated = Number(line.description.match(/,\s*(\d+)\s+Betten?$/)?.[1] ?? '1')
+    const pricePerBedNight = bedsAllocated > 0 ? line.unitPriceNet / bedsAllocated : line.unitPriceNet
+    return `${line.name}: ${formatMoney(pricePerBedNight)} pro Bett/Nacht`
+  }).join(', ')
 
   return [
     'Wie soll der Bettenpreis sein?',
     `Aktuell: ${priceSummary || 'kein Preis gefunden'}`,
-    'Antworte mit einer Zahl wie <code>30</code> oder mit <code>übernehmen</code>.',
+    'Antworte mit einer Zahl wie <code>30</code> für EUR pro Bett/Nacht oder mit <code>übernehmen</code>.',
   ].join('\n')
 }
 
@@ -371,6 +375,16 @@ function setAllLinePrices(state: TelegramConversationState, lineKind: 'booking' 
     lines: state.invoiceForm.lines.map(line => {
       if (line.kind !== lineKind) return line
       changed = true
+      if (lineKind === 'booking') {
+        const relatedInvoiceLine = state.invoiceLines?.find(invoiceLine =>
+          line.sourceKey && line.sourceKey === `${invoiceLine.requestId}:${invoiceLine.propertyId}`,
+        )
+        const bedsAllocated = relatedInvoiceLine?.bedsAllocated ?? Number(line.description.match(/,\s*(\d+)\s+Betten?$/)?.[1] ?? '1')
+        return {
+          ...line,
+          unitPriceNet: amount * Math.max(1, bedsAllocated),
+        }
+      }
       return {
         ...line,
         unitPriceNet: amount,
