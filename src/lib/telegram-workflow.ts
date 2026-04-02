@@ -68,6 +68,10 @@ type TelegramRequestContext = {
   matchedCustomerId?: string
   matchedCustomerName?: string
   requestedNetPrice?: number
+  requestedDiscountPercentage?: number
+  requestedCleaningFee?: number
+  requestedTaxRate?: 0 | 7 | 19
+  requestedPaymentTermDays?: number
   customerName?: string
   billingCompanyName?: string
   contactName?: string
@@ -332,6 +336,45 @@ function applyBookingPriceToForm(
   }
 }
 
+function addCleaningLineToForm(
+  invoiceForm: InvoiceFormState,
+  invoiceLines: InvoiceLineItem[] | undefined,
+  amount: number,
+) {
+  return {
+    ...invoiceForm,
+    lines: [
+      ...invoiceForm.lines,
+      {
+        id: `draft-line-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        kind: 'cleaning' as const,
+        sourceKey: invoiceForm.lines.find(line => line.kind === 'booking')?.sourceKey,
+        propertyId: invoiceLines?.[0]?.propertyId,
+        requestId: invoiceLines?.[0]?.requestId,
+        positionNumber: invoiceLines?.[0]?.positionNumber,
+        name: `${invoiceLines?.[0]?.shortCode || invoiceLines?.[0]?.propertyName || 'Endreinigung'} - Endreinigung`,
+        description: invoiceLines?.[0]
+          ? `${invoiceLines[0].propertyName}, ${invoiceLines[0].locationName}, ${formatRange(invoiceLines[0].checkIn, invoiceLines[0].checkOut)}`
+          : 'Endreinigung',
+        quantity: 1,
+        unitName: 'Pauschale',
+        unitPriceNet: amount,
+        discountPercentage: 0,
+        taxRate: invoiceForm.lines.find(line => line.kind === 'booking')?.taxRate ?? 0,
+      },
+    ],
+  }
+}
+
+function buildDraftConfirmationReply(state: TelegramConversationState, customer?: Customer | null) {
+  return [
+    formatInvoiceFormSummary(state, customer),
+    '',
+    'Soll ich den Lexoffice-Entwurf jetzt erstellen?',
+    'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
+  ].join('\n')
+}
+
 function buildCleaningPrompt(invoiceForm: InvoiceFormState) {
   const cleaningLines = invoiceForm.lines.filter(line => line.kind === 'cleaning')
   if (cleaningLines.length === 0) {
@@ -453,6 +496,49 @@ function setAllTaxRates(state: TelegramConversationState, taxRate: 0 | 7 | 19) {
   state.draftInvoice = undefined
 }
 
+async function moveToNextRequiredStep(chatId: number | string, state: TelegramConversationState): Promise<HandlerResult> {
+  if (!state.invoiceForm) {
+    throw new Error('Es gibt noch keinen aktiven Vorgang.')
+  }
+
+  if (!state.customerId) {
+    state.stage = 'awaiting_customer'
+    await saveConversation(chatId, state)
+    return {
+      handled: true,
+      reply: 'Wie heißt der Auftraggeber? Bitte sende einfach den Firmennamen.',
+    }
+  }
+
+  if (state.requestContext?.requestedNetPrice === undefined) {
+    state.stage = 'awaiting_price'
+    await saveConversation(chatId, state)
+    return {
+      handled: true,
+      reply: buildBookingPricePrompt(state.invoiceForm),
+    }
+  }
+
+  const hasCleaningLines = state.invoiceForm.lines.some(line => line.kind === 'cleaning')
+  if (!hasCleaningLines && state.requestContext?.requestedCleaningFee === undefined) {
+    state.stage = 'awaiting_cleaning'
+    await saveConversation(chatId, state)
+    return {
+      handled: true,
+      reply: buildCleaningPrompt(state.invoiceForm),
+    }
+  }
+
+  state.stage = 'awaiting_draft_confirmation'
+  state.draftInvoice = undefined
+  const customer = state.customerId ? await getCustomerById(state.customerId) : null
+  await saveConversation(chatId, state)
+  return {
+    handled: true,
+    reply: buildDraftConfirmationReply(state, customer),
+  }
+}
+
 async function loadConversation(chatId: number | string): Promise<ConversationRow | null> {
   const { data, error } = await supabaseAdmin
     .from('telegram_conversations')
@@ -549,6 +635,10 @@ async function buildConversationStateFromAvailability(args: {
           matchedCustomerId: richParsed.matchedCustomerId,
           matchedCustomerName: richParsed.matchedCustomerName,
           requestedNetPrice: richParsed.requestedNetPrice,
+          requestedDiscountPercentage: richParsed.requestedDiscountPercentage,
+          requestedCleaningFee: richParsed.requestedCleaningFee,
+          requestedTaxRate: richParsed.requestedTaxRate,
+          requestedPaymentTermDays: richParsed.requestedPaymentTermDays,
           customerName: richParsed.customerName,
           billingCompanyName: richParsed.billingCompanyName,
           contactName: richParsed.contactName,
@@ -617,6 +707,37 @@ async function buildConversationStateFromAvailability(args: {
   if (richParsed.requestedNetPrice !== undefined) {
     Object.assign(invoiceForm, applyBookingPriceToForm(invoiceForm, invoiceLines, richParsed.requestedNetPrice))
   }
+  if (richParsed.requestedDiscountPercentage !== undefined) {
+    invoiceForm.totalDiscountPercentage = richParsed.requestedDiscountPercentage
+  }
+  if (richParsed.requestedCleaningFee !== undefined) {
+    const hasCleaningLines = invoiceForm.lines.some(line => line.kind === 'cleaning')
+    if (hasCleaningLines) {
+      Object.assign(invoiceForm, {
+        ...invoiceForm,
+        lines: invoiceForm.lines.map(line => (
+          line.kind === 'cleaning'
+            ? { ...line, unitPriceNet: richParsed.requestedCleaningFee! }
+            : line
+        )),
+      })
+    } else if (richParsed.requestedCleaningFee > 0) {
+      Object.assign(invoiceForm, addCleaningLineToForm(invoiceForm, invoiceLines, richParsed.requestedCleaningFee))
+    }
+  }
+  if (richParsed.requestedTaxRate !== undefined) {
+    Object.assign(invoiceForm, {
+      ...invoiceForm,
+      lines: invoiceForm.lines.map(line => (
+        line.kind === 'text'
+          ? line
+          : { ...line, taxRate: richParsed.requestedTaxRate! }
+      )),
+    })
+  }
+  if (richParsed.requestedPaymentTermDays !== undefined) {
+    invoiceForm.paymentTermDays = richParsed.requestedPaymentTermDays
+  }
 
   invoiceForm.customerName = invoiceForm.customerName || richParsed.billingCompanyName || richParsed.customerName || ''
   invoiceForm.addressSupplement = invoiceForm.addressSupplement || richParsed.billingAddressSupplement || richParsed.contactName || ''
@@ -641,6 +762,10 @@ async function buildConversationStateFromAvailability(args: {
         matchedCustomerId: richParsed.matchedCustomerId,
         matchedCustomerName: richParsed.matchedCustomerName,
         requestedNetPrice: richParsed.requestedNetPrice,
+        requestedDiscountPercentage: richParsed.requestedDiscountPercentage,
+        requestedCleaningFee: richParsed.requestedCleaningFee,
+        requestedTaxRate: richParsed.requestedTaxRate,
+        requestedPaymentTermDays: richParsed.requestedPaymentTermDays,
         customerName: richParsed.customerName,
         billingCompanyName: richParsed.billingCompanyName,
         contactName: richParsed.contactName,
@@ -725,16 +850,11 @@ async function selectCustomer(state: TelegramConversationState, query: string) {
         city: invoiceForm.city || state.requestContext?.billingCity || '',
         countryCode: invoiceForm.countryCode || inferCountryCodeFromValue(state.requestContext?.billingCountry || createdCustomer.country),
       }
-      state.stage = 'awaiting_price'
       state.draftInvoice = undefined
 
       return {
         state,
-        reply: [
-          `Auftraggeber neu angelegt: <b>${createdCustomer.companyName}</b>`,
-          '',
-          buildBookingPricePrompt(state.invoiceForm),
-        ].join('\n'),
+        reply: `Auftraggeber neu angelegt: <b>${createdCustomer.companyName}</b>`,
       }
     }
 
@@ -789,16 +909,11 @@ async function selectCustomer(state: TelegramConversationState, query: string) {
     city: invoiceForm.city || customer.city || state.requestContext?.billingCity || '',
     countryCode: invoiceForm.countryCode || inferCountryCodeFromValue(state.requestContext?.billingCountry || customer.country),
   }
-  state.stage = 'awaiting_price'
   state.draftInvoice = undefined
 
   return {
     state,
-    reply: [
-      `Auftraggeber gesetzt: <b>${customer.companyName}</b>`,
-      '',
-      buildBookingPricePrompt(state.invoiceForm),
-    ].join('\n'),
+    reply: `Auftraggeber gesetzt: <b>${customer.companyName}</b>`,
   }
 }
 
@@ -898,14 +1013,13 @@ async function createBookingsForState(state: TelegramConversationState) {
 async function handleCreateDecision(chatId: number | string, state: TelegramConversationState, text: string): Promise<HandlerResult> {
   if (isYes(text)) {
     if (state.customerId) {
-      state.stage = 'awaiting_price'
-      await saveConversation(chatId, state)
+      const next = await moveToNextRequiredStep(chatId, state)
       return {
-        handled: true,
+        ...next,
         reply: [
           `Auftraggeber erkannt: <b>${state.invoiceForm?.customerName ?? state.requestContext?.matchedCustomerName ?? 'Auftraggeber'}</b>`,
           '',
-          buildBookingPricePrompt(state.invoiceForm!),
+          next.reply,
         ].join('\n'),
       }
     }
@@ -940,14 +1054,13 @@ async function handleCreateDecision(chatId: number | string, state: TelegramConv
         city: invoiceForm.city || state.requestContext?.billingCity || '',
         countryCode: invoiceForm.countryCode || inferCountryCodeFromValue(state.requestContext?.billingCountry || createdCustomer.country),
       }
-      state.stage = 'awaiting_price'
-      await saveConversation(chatId, state)
+      const next = await moveToNextRequiredStep(chatId, state)
       return {
-        handled: true,
+        ...next,
         reply: [
           `Auftraggeber neu angelegt: <b>${createdCustomer.companyName}</b>`,
           '',
-          buildBookingPricePrompt(state.invoiceForm),
+          next.reply,
         ].join('\n'),
       }
     }
@@ -1022,9 +1135,14 @@ async function handlePriceStep(chatId: number | string, state: TelegramConversat
         reply: buildBookingPricePrompt(state.invoiceForm),
       }
     }
-    setAllLinePrices(state, 'booking', amount)
+      setAllLinePrices(state, 'booking', amount)
+      state.requestContext = {
+        ...state.requestContext,
+        requestedNetPrice: amount,
+      }
   }
 
+  return moveToNextRequiredStep(chatId, state)
   state.stage = 'awaiting_discount'
   await saveConversation(chatId, state)
   return {
@@ -1078,31 +1196,20 @@ async function handleCleaningStep(chatId: number | string, state: TelegramConver
     if (hasCleaningLines) {
       setAllLinePrices(state, 'cleaning', amount)
     } else if (amount > 0) {
-      state.invoiceForm.lines.push({
-        id: `draft-line-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        kind: 'cleaning',
-        sourceKey: state.invoiceForm.lines.find(line => line.kind === 'booking')?.sourceKey,
-        propertyId: state.invoiceLines?.[0]?.propertyId,
-        requestId: state.invoiceLines?.[0]?.requestId,
-        positionNumber: state.invoiceLines?.[0]?.positionNumber,
-        name: `${state.invoiceLines?.[0]?.shortCode || state.invoiceLines?.[0]?.propertyName || 'Endreinigung'} - Endreinigung`,
-        description: state.invoiceLines?.[0]
-          ? `${state.invoiceLines[0].propertyName}, ${state.invoiceLines[0].locationName}, ${formatRange(state.invoiceLines[0].checkIn, state.invoiceLines[0].checkOut)}`
-          : 'Endreinigung',
-        quantity: 1,
-        unitName: 'Pauschale',
-        unitPriceNet: amount,
-        discountPercentage: 0,
-        taxRate: state.invoiceForm.lines.find(line => line.kind === 'booking')?.taxRate ?? 0,
-      })
+      state.invoiceForm = addCleaningLineToForm(state.invoiceForm, state.invoiceLines, amount)
+    }
+    state.requestContext = {
+      ...state.requestContext,
+      requestedCleaningFee: amount,
     }
   }
 
+  return moveToNextRequiredStep(chatId, state)
   state.stage = 'awaiting_tax_rate'
   await saveConversation(chatId, state)
   return {
     handled: true,
-    reply: buildTaxRatePrompt(state.invoiceForm),
+    reply: buildTaxRatePrompt(state.invoiceForm!),
   }
 }
 
@@ -1282,8 +1389,16 @@ export async function handleTelegramWorkflowMessage(chatId: number | string, tex
 
   if (state.stage === 'awaiting_customer') {
     const result = await selectCustomer(state, trimmed)
-    await saveConversation(chatId, result.state)
-    return { handled: true, reply: result.reply }
+    if (!result.state.customerId) {
+      await saveConversation(chatId, result.state)
+      return { handled: true, reply: result.reply }
+    }
+
+    const next = await moveToNextRequiredStep(chatId, result.state)
+    return {
+      handled: true,
+      reply: [result.reply, '', next.reply].join('\n'),
+    }
   }
 
   if (state.stage === 'awaiting_price') {

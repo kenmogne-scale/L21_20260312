@@ -7,6 +7,10 @@ export type ParsedBookingRequest = {
   bedsNeeded?: number
   requestedRooms?: number
   requestedNetPrice?: number
+  requestedDiscountPercentage?: number
+  requestedCleaningFee?: number
+  requestedTaxRate?: 0 | 7 | 19
+  requestedPaymentTermDays?: number
   contactName?: string
   email?: string
   phone?: string
@@ -92,6 +96,43 @@ function extractRequestedNetPrice(text: string) {
   }
 
   return undefined
+}
+
+function extractRequestedDiscountPercentage(text: string) {
+  const match = text.match(/rabatt\s*:?\s*(\d+(?:[.,]\d+)?)\s*%/i)
+  if (!match?.[1]) return undefined
+  const amount = Number(match[1].replace(',', '.'))
+  return Number.isFinite(amount) ? amount : undefined
+}
+
+function extractRequestedCleaningFee(text: string) {
+  const patterns = [
+    /(?:endreinigung|reinigung(?:sgebuhr|sgebühr)?|reinigungskosten)\s*:?\s*(\d+(?:[.,]\d+)?)\s*(?:€|eur)?/i,
+    /(\d+(?:[.,]\d+)?)\s*(?:€|eur)\s*(?:f(?:u|ü)r\s+)?(?:endreinigung|reinigung)/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (!match?.[1]) continue
+    const amount = Number(match[1].replace(',', '.'))
+    if (Number.isFinite(amount)) return amount
+  }
+
+  return undefined
+}
+
+function extractRequestedTaxRate(text: string): 0 | 7 | 19 | undefined {
+  const match = text.match(/(?:mwst|ust|steuer(?:satz)?)\s*:?\s*(0|7|19)\s*%/i)
+  if (!match?.[1]) return undefined
+  const amount = Number(match[1])
+  return amount === 0 || amount === 7 || amount === 19 ? amount : undefined
+}
+
+function extractRequestedPaymentTermDays(text: string) {
+  const match = text.match(/(?:zahlungsziel|netto)\s*:?\s*(\d{1,3})\s*tage?/i)
+  if (!match?.[1]) return undefined
+  const amount = Number(match[1])
+  return Number.isFinite(amount) ? amount : undefined
 }
 
 function findBillingBlock(text: string) {
@@ -271,6 +312,10 @@ export function parseBookingRequest(
   const bedsNeeded = personsMatch ? Number(personsMatch[1]) : undefined
   const requestedRooms = roomMatch ? Number(roomMatch[1]) : undefined
   const parsedRequestedNetPrice = extractRequestedNetPrice(trimmed)
+  const requestedDiscountPercentage = extractRequestedDiscountPercentage(trimmed)
+  const requestedCleaningFee = extractRequestedCleaningFee(trimmed)
+  const requestedTaxRate = extractRequestedTaxRate(trimmed)
+  const requestedPaymentTermDays = extractRequestedPaymentTermDays(trimmed)
 
   const priceMatch =
     trimmed.match(/(\d+(?:[.,]\d+)?)\s*€?\s*netto/i) ??
@@ -344,6 +389,10 @@ export function parseBookingRequest(
     bedsNeeded,
     requestedRooms,
     requestedNetPrice: parsedRequestedNetPrice ?? requestedNetPrice,
+    requestedDiscountPercentage,
+    requestedCleaningFee,
+    requestedTaxRate,
+    requestedPaymentTermDays,
     contactName,
     email,
     phone,
