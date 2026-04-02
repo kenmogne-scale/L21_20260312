@@ -67,6 +67,7 @@ type TelegramPropertyChoice = {
 type TelegramRequestContext = {
   matchedCustomerId?: string
   matchedCustomerName?: string
+  requestedNetPrice?: number
   customerName?: string
   billingCompanyName?: string
   contactName?: string
@@ -306,6 +307,31 @@ function buildBookingPricePrompt(invoiceForm: InvoiceFormState) {
   ].join('\n')
 }
 
+function applyBookingPriceToForm(
+  invoiceForm: InvoiceFormState,
+  invoiceLines: InvoiceLineItem[] | undefined,
+  amount: number,
+) {
+  return {
+    ...invoiceForm,
+    lines: invoiceForm.lines.map(line => {
+      if (line.kind !== 'booking') return line
+
+      const relatedInvoiceLine = invoiceLines?.find(invoiceLine =>
+        line.sourceKey && line.sourceKey === `${invoiceLine.requestId}:${invoiceLine.propertyId}`,
+      )
+      const bedsAllocated =
+        relatedInvoiceLine?.bedsAllocated ??
+        Number(line.description.match(/,\s*(\d+)\s+Betten?$/)?.[1] ?? '1')
+
+      return {
+        ...line,
+        unitPriceNet: amount * Math.max(1, bedsAllocated),
+      }
+    }),
+  }
+}
+
 function buildCleaningPrompt(invoiceForm: InvoiceFormState) {
   const cleaningLines = invoiceForm.lines.filter(line => line.kind === 'cleaning')
   if (cleaningLines.length === 0) {
@@ -522,6 +548,7 @@ async function buildConversationStateFromAvailability(args: {
         requestContext: {
           matchedCustomerId: richParsed.matchedCustomerId,
           matchedCustomerName: richParsed.matchedCustomerName,
+          requestedNetPrice: richParsed.requestedNetPrice,
           customerName: richParsed.customerName,
           billingCompanyName: richParsed.billingCompanyName,
           contactName: richParsed.contactName,
@@ -587,6 +614,10 @@ async function buildConversationStateFromAvailability(args: {
     fallbackCountryCode,
   })
 
+  if (richParsed.requestedNetPrice !== undefined) {
+    Object.assign(invoiceForm, applyBookingPriceToForm(invoiceForm, invoiceLines, richParsed.requestedNetPrice))
+  }
+
   invoiceForm.customerName = invoiceForm.customerName || richParsed.billingCompanyName || richParsed.customerName || ''
   invoiceForm.addressSupplement = invoiceForm.addressSupplement || richParsed.billingAddressSupplement || richParsed.contactName || ''
   invoiceForm.street = invoiceForm.street || richParsed.billingStreet || ''
@@ -609,6 +640,7 @@ async function buildConversationStateFromAvailability(args: {
       requestContext: {
         matchedCustomerId: richParsed.matchedCustomerId,
         matchedCustomerName: richParsed.matchedCustomerName,
+        requestedNetPrice: richParsed.requestedNetPrice,
         customerName: richParsed.customerName,
         billingCompanyName: richParsed.billingCompanyName,
         contactName: richParsed.contactName,

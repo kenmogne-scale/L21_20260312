@@ -76,6 +76,24 @@ function extractFirstMatch(text: string, pattern: RegExp) {
   return match?.[1]?.trim()
 }
 
+function extractRequestedNetPrice(text: string) {
+  const patterns = [
+    /(?:zimmerpreis|bettenpreis|bettpreis|ez-preis|einzelzimmerpreis)\s*:?\s*(\d+(?:[.,]\d+)?)\s*(?:€|eur)?/i,
+    /preis\s*(?:bitte)?\s*(\d+(?:[.,]\d+)?)\s*(?:€|eur)?\s*(?:netto)?\s*(?:(?:pro|je)\s*(?:ez|einzelzimmer|zimmer|bett))?/i,
+    /(\d+(?:[.,]\d+)?)\s*(?:€|eur)\s*(?:netto)?\s*(?:(?:pro|je)\s*(?:ez|einzelzimmer|zimmer|bett))?/i,
+    /(\d+(?:[.,]\d+)?)\s*(?:€|eur)?\s*(?:netto\s*)?(?:pro|je)\s*(?:ez|einzelzimmer|zimmer|bett)(?:\/nacht|\s+pro\s+nacht)?/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (!match?.[1]) continue
+    const amount = Number(match[1].replace(',', '.'))
+    if (Number.isFinite(amount)) return amount
+  }
+
+  return undefined
+}
+
 function findBillingBlock(text: string) {
   const match = text.match(/billing address\s*:?\s*([\s\S]+)/i)
   if (!match) return undefined
@@ -252,6 +270,7 @@ export function parseBookingRequest(
   const roomMatch = trimmed.match(/(\d+)\s*[- ]?\s*zimmer/i)
   const bedsNeeded = personsMatch ? Number(personsMatch[1]) : undefined
   const requestedRooms = roomMatch ? Number(roomMatch[1]) : undefined
+  const parsedRequestedNetPrice = extractRequestedNetPrice(trimmed)
 
   const priceMatch =
     trimmed.match(/(\d+(?:[.,]\d+)?)\s*€?\s*netto/i) ??
@@ -324,7 +343,7 @@ export function parseBookingRequest(
     checkOut,
     bedsNeeded,
     requestedRooms,
-    requestedNetPrice,
+    requestedNetPrice: parsedRequestedNetPrice ?? requestedNetPrice,
     contactName,
     email,
     phone,
