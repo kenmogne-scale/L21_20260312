@@ -74,6 +74,12 @@ export type InvoiceTotals = {
 
 export type BookingInsertInput = Omit<Booking, 'id' | 'bookingNumber' | 'createdAt' | 'updatedAt'>
 
+export const DEFAULT_INVOICE_REMARK = [
+  'Vielen Dank für Ihre Buchung!',
+  '',
+  '***Die Kündigungsfrist beträgt 2 Wochen vor Vertragsende/Mietende. Die Kündigung muss schriftlich erfolgen. Sollte keine Kündigung erfolgen, so verlängert sich das Mietverhältnis automatisch.***',
+].join('\n')
+
 export function formatRange(checkIn: string, checkOut: string) {
   return `${format(new Date(checkIn), 'dd.MM.yyyy')} - ${format(new Date(checkOut), 'dd.MM.yyyy')}`
 }
@@ -176,7 +182,7 @@ export function createInitialInvoiceForm(args: {
     serviceDateTo: serviceDates.at(-1) ?? serviceDates[0] ?? today,
     title: 'Rechnung',
     introduction: customer?.companyName ? `Rechnung für ${customer.companyName}` : 'Rechnung',
-    remark: notes.trim(),
+    remark: DEFAULT_INVOICE_REMARK,
     paymentTermDays: 14,
     totalDiscountPercentage,
     lines,

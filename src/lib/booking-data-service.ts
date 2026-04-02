@@ -118,7 +118,6 @@ export async function findCustomersByQuery(query: string, limit = 5): Promise<Cu
   if (!normalizedQuery) return []
   const customers = await loadCustomersServer()
   return customers
-    .filter(customer => customer.lexofficeContactId)
     .map(customer => {
       const haystack = normalizeSearch([
         customer.companyName,
@@ -146,6 +145,32 @@ export async function getCustomerById(customerId: string): Promise<Customer | nu
   const { data, error } = await supabaseAdmin.from('customers').select('*').eq('id', customerId).maybeSingle()
   if (error) throw new Error(`Auftraggeber konnte nicht geladen werden: ${error.message}`)
   return data ? mapCustomer(data) : null
+}
+
+export async function updateCustomerServer(customerId: string, data: Partial<Customer>): Promise<Customer> {
+  const row: Record<string, unknown> = {}
+  if (data.companyName !== undefined) row.company_name = data.companyName
+  if (data.firstName !== undefined) row.first_name = data.firstName
+  if (data.lastName !== undefined) row.last_name = data.lastName
+  if (data.email !== undefined) row.email = data.email
+  if (data.phone !== undefined) row.phone = data.phone
+  if (data.address !== undefined) row.address = data.address
+  if (data.zip !== undefined) row.zip = data.zip
+  if (data.city !== undefined) row.city = data.city
+  if (data.country !== undefined) row.country = data.country
+  if (data.taxId !== undefined) row.tax_id = data.taxId
+  if (data.lexofficeContactId !== undefined) row.lexoffice_contact_id = data.lexofficeContactId
+  if (data.notes !== undefined) row.notes = data.notes
+
+  const { data: updated, error } = await supabaseAdmin
+    .from('customers')
+    .update(row)
+    .eq('id', customerId)
+    .select('*')
+    .single()
+
+  if (error) throw new Error(`Auftraggeber konnte nicht aktualisiert werden: ${error.message}`)
+  return mapCustomer(updated)
 }
 
 export async function addBookingServer(input: BookingInsertInput): Promise<Booking> {

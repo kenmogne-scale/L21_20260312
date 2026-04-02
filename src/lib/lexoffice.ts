@@ -251,6 +251,37 @@ export interface LexContactsResponse {
   size: number
 }
 
+export interface CreateContactPayload {
+  roles: { customer: Record<string, never> }
+  company?: {
+    name: string
+    taxNumber?: string
+    contactPersons?: Array<{
+      firstName?: string
+      lastName?: string
+      emailAddress?: string
+      phoneNumber?: string
+      primary?: boolean
+    }>
+  }
+  person?: {
+    firstName?: string
+    lastName: string
+  }
+  addresses: {
+    billing: Array<{
+      supplement?: string
+      street?: string
+      zip?: string
+      city?: string
+      countryCode: string
+    }>
+  }
+  emailAddresses?: { business?: string[] }
+  phoneNumbers?: { business?: string[] }
+  note?: string
+}
+
 export async function getContacts(page = 0, size = 100): Promise<LexContactsResponse> {
   return lexFetch(`/contacts?page=${page}&size=${size}&direction=ASC&property=name`) as Promise<LexContactsResponse>
 }
@@ -263,6 +294,20 @@ export async function getAllContacts(): Promise<LexContact[]> {
     all.push(...page.content)
   }
   return all
+}
+
+export async function createContact(payload: CreateContactPayload): Promise<{ id: string }> {
+  const result = await lexFetch('/contacts', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }) as { id?: string; resourceUri?: string }
+
+  const id = result.id ?? result.resourceUri?.split('/').at(-1)
+  if (!id) {
+    throw new Error('Lexoffice-Kontakt wurde erstellt, aber es konnte keine Kontakt-ID gelesen werden.')
+  }
+
+  return { id }
 }
 
 // ─── Create Invoice ───────────────────────────────────────────────────────────

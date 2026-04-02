@@ -2,11 +2,15 @@ import 'server-only'
 
 import { checkAvailability, loadLocations } from '@/lib/availability-service'
 import { parseAvailabilityMessage } from '@/lib/availability-message-parser'
+import { parseBookingRequest } from '@/lib/booking-request-parser'
 import { createTelegramAvailabilityMessage } from '@/lib/availability-response'
 import {
   addBookingServer,
   findCustomersByQuery,
   getCustomerById,
+  loadCustomersServer,
+  loadPropertiesServer,
+  updateCustomerServer,
 } from '@/lib/booking-data-service'
 import {
   buildBookingInsertInputs,
@@ -14,17 +18,19 @@ import {
   buildLexofficeInvoicePayload,
   calculateInvoiceFormTotals,
   createInitialInvoiceForm,
+  DEFAULT_INVOICE_REMARK,
   inferCountryCode,
   type DraftInvoiceState,
   type InvoiceFormState,
   type InvoiceLineItem,
 } from '@/lib/booking-workflow'
-import { createInvoice, downloadInvoicePdf, getInvoice } from '@/lib/lexoffice'
+import { createContact, createInvoice, downloadInvoicePdf, getInvoice, type CreateContactPayload } from '@/lib/lexoffice'
 import { supabaseAdmin } from '@/lib/supabase-admin'
 import type { BookingStatus, Customer } from '@/lib/types'
 
 type TelegramConversationStage =
   | 'idle'
+  | 'awaiting_property_selection'
   | 'awaiting_create_decision'
   | 'awaiting_customer'
   | 'awaiting_price'
@@ -46,12 +52,40 @@ type TelegramDraftRequest = {
   originalText: string
 }
 
+type TelegramPropertyChoice = {
+  propertyId: string
+  propertyName: string
+  shortCode: string
+  totalBeds: number
+  freeBeds: number
+  pricePerBedNight: number
+  cleaningFee: number
+}
+
+type TelegramRequestContext = {
+  matchedCustomerId?: string
+  matchedCustomerName?: string
+  contactName?: string
+  email?: string
+  phone?: string
+  billingAddressSupplement?: string
+  billingStreet?: string
+  billingZip?: string
+  billingCity?: string
+  billingCountry?: string
+  billingTaxId?: string
+  project?: string
+  reference?: string
+}
+
 type TelegramConversationState = {
   stage: TelegramConversationStage
   request?: TelegramDraftRequest
+  requestContext?: TelegramRequestContext
   invoiceLines?: InvoiceLineItem[]
   invoiceForm?: InvoiceFormState
   customerId?: string
+  propertyChoices?: TelegramPropertyChoice[]
   bookingStatus?: BookingStatus
   draftInvoice?: DraftInvoiceState
   createdBookingIds?: string[]
@@ -124,6 +158,78 @@ function parseNumberFromText(value: string): number | null {
 
 function formatMoney(value: number) {
   return `${value.toFixed(2)} EUR`
+}
+
+function inferCountryCodeFromValue(value?: string) {
+  const raw = value?.trim().toLowerCase()
+  if (!raw || raw === 'de' || raw === 'deutschland' || raw === 'germany') return 'DE'
+  if (raw === 'norway' || raw === 'norwegen' || raw === 'no') return 'NO'
+  if (raw.length === 2) return raw.toUpperCase()
+  return value?.slice(0, 2).toUpperCase() || 'DE'
+}
+
+function trimForLexofficeNote(value?: string, maxLength = 1000) {
+  const normalized = value?.trim()
+  if (!normalized) return undefined
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
+}
+
+function buildLexofficeContactPayload(args: {
+  companyName: string
+  addressSupplement?: string
+  street?: string
+  zip?: string
+  city?: string
+  countryCode: string
+  email?: string
+  phone?: string
+  firstName?: string
+  lastName?: string
+  taxId?: string
+  note?: string
+}): CreateContactPayload {
+  const { companyName, addressSupplement, street, zip, city, countryCode, email, phone, firstName, lastName, taxId, note } = args
+
+  return {
+    roles: { customer: {} },
+    company: {
+      name: companyName,
+      taxNumber: taxId || undefined,
+      contactPersons: lastName || firstName || email || phone
+        ? [{
+            firstName: firstName || undefined,
+            lastName: lastName || undefined,
+            emailAddress: email || undefined,
+            phoneNumber: phone || undefined,
+            primary: true,
+          }]
+        : undefined,
+    },
+    addresses: {
+      billing: [{
+        supplement: addressSupplement || undefined,
+        street: street || undefined,
+        zip: zip || undefined,
+        city: city || undefined,
+        countryCode,
+      }],
+    },
+    emailAddresses: email ? { business: [email] } : undefined,
+    phoneNumbers: phone ? { business: [phone] } : undefined,
+    note: trimForLexofficeNote(note),
+  }
+}
+
+function buildPropertyChoiceReply(choices: TelegramPropertyChoice[]) {
+  return [
+    'Mehrere passende Wohnungen sind frei. Welche Einheit soll ich nehmen?',
+    ...choices.map((choice, index) =>
+      `${index + 1}. ${choice.shortCode || choice.propertyName} · ${choice.freeBeds}/${choice.totalBeds} frei · ${formatMoney(choice.pricePerBedNight)} pro Bett/Nacht`
+    ),
+    '',
+    'Antworte mit der Nummer, z. B. <code>1</code>.',
+  ].join('\n')
 }
 
 function buildHelpMessage() {
@@ -294,58 +400,194 @@ async function resetConversation(chatId: number | string) {
   await saveConversation(chatId, defaultState())
 }
 
-async function handleAvailabilityStart(chatId: number | string, text: string): Promise<HandlerResult> {
-  const locations = await loadLocations()
-  const parsedRequest = parseAvailabilityMessage(text, locations)
+async function buildConversationStateFromAvailability(args: {
+  text: string
+  forcedPropertyId?: string
+}) {
+  const { text, forcedPropertyId } = args
+  const [locations, properties, customers] = await Promise.all([
+    loadLocations(),
+    loadPropertiesServer(),
+    loadCustomersServer(),
+  ])
+
+  const richParsed = parseBookingRequest(text, { properties, locations, customers })
+  const parsedRequest =
+    richParsed.checkIn && richParsed.checkOut && richParsed.bedsNeeded && richParsed.matchedLocationId
+      ? {
+          locationId: richParsed.matchedLocationId,
+          locationName: richParsed.matchedLocationName,
+          checkIn: richParsed.checkIn,
+          checkOut: richParsed.checkOut,
+          bedsNeeded: richParsed.bedsNeeded,
+          strategy: 'fewest-properties' as const,
+          originalText: richParsed.originalText,
+          normalizedText: richParsed.originalText,
+        }
+      : parseAvailabilityMessage(text, locations)
+
   const result = await checkAvailability(parsedRequest)
   const availabilityReply = createTelegramAvailabilityMessage(result, parsedRequest)
 
   if (!result.allocation.success || result.allocation.allocations.length === 0) {
-    await resetConversation(chatId)
+    return { state: defaultState(), reply: availabilityReply }
+  }
+
+  const preferredIds = new Set(richParsed.matchedProperties.map(property => property.id))
+  const choiceCandidates = result.matchingProperties
+    .filter(property => property.freeBeds >= parsedRequest.bedsNeeded)
+    .filter(property => preferredIds.size === 0 || preferredIds.has(property.propertyId))
+
+  if (!forcedPropertyId && choiceCandidates.length > 1) {
+    const propertyChoices = choiceCandidates.map(choice => ({
+      propertyId: choice.propertyId,
+      propertyName: choice.propertyName,
+      shortCode: choice.shortCode,
+      totalBeds: choice.totalBeds,
+      freeBeds: choice.freeBeds,
+      pricePerBedNight: choice.pricePerBedNight,
+      cleaningFee: choice.cleaningFee,
+    }))
+
     return {
-      handled: true,
-      reply: availabilityReply,
+      state: {
+        stage: 'awaiting_property_selection' as const,
+        request: {
+          locationId: result.location.id,
+          locationName: result.location.name,
+          checkIn: parsedRequest.checkIn,
+          checkOut: parsedRequest.checkOut,
+          bedsNeeded: parsedRequest.bedsNeeded,
+          originalText: parsedRequest.originalText,
+        },
+        requestContext: {
+          matchedCustomerId: richParsed.matchedCustomerId,
+          matchedCustomerName: richParsed.matchedCustomerName,
+          contactName: richParsed.contactName,
+          email: richParsed.email,
+          phone: richParsed.phone,
+          billingAddressSupplement: richParsed.billingAddressSupplement,
+          billingStreet: richParsed.billingStreet,
+          billingZip: richParsed.billingZip,
+          billingCity: richParsed.billingCity,
+          billingCountry: richParsed.billingCountry,
+          billingTaxId: richParsed.billingTaxId,
+          project: richParsed.project,
+          reference: richParsed.reference,
+        },
+        propertyChoices,
+        bookingStatus: 'bestaetigt' as const,
+      },
+      reply: [availabilityReply, '', buildPropertyChoiceReply(propertyChoices)].join('\n'),
     }
   }
+
+  const selectedChoice = forcedPropertyId
+    ? result.matchingProperties.find(property => property.propertyId === forcedPropertyId)
+    : choiceCandidates.length === 1
+      ? choiceCandidates[0]
+      : undefined
+
+  const allocations = selectedChoice
+    ? [{
+        propertyId: selectedChoice.propertyId,
+        propertyName: selectedChoice.propertyName,
+        shortCode: selectedChoice.shortCode,
+        bedsAllocated: parsedRequest.bedsNeeded,
+        totalBeds: selectedChoice.totalBeds,
+        minFreeBeds: selectedChoice.freeBeds,
+        pricePerBedNight: selectedChoice.pricePerBedNight,
+        cleaningFee: selectedChoice.cleaningFee,
+        nights: result.allocation.nights,
+        subtotal: selectedChoice.pricePerBedNight * parsedRequest.bedsNeeded * result.allocation.nights + selectedChoice.cleaningFee,
+      }]
+    : result.allocation.allocations
 
   const invoiceLines = buildInvoiceLinesFromAllocation({
     requestId: `tg-${Date.now()}`,
     locationName: result.location.name,
     checkIn: parsedRequest.checkIn,
     checkOut: parsedRequest.checkOut,
-    allocations: result.allocation.allocations,
+    allocations,
   })
 
+  const matchedCustomer = richParsed.matchedCustomerId
+    ? customers.find(customer => customer.id === richParsed.matchedCustomerId)
+    : undefined
+  const fallbackCountryCode = inferCountryCodeFromValue(richParsed.billingCountry || matchedCustomer?.country)
   const invoiceForm = createInitialInvoiceForm({
-    customer: undefined,
+    customer: matchedCustomer,
     invoiceLines,
-    notes: `Telegram-Anfrage: ${parsedRequest.originalText}`,
+    notes: parsedRequest.originalText,
     defaultTaxRate: 0,
     totalDiscountPercentage: 0,
-    fallbackCountryCode: 'DE',
+    fallbackCountryCode,
   })
 
-  const state: TelegramConversationState = {
-    stage: 'awaiting_create_decision',
-    request: {
-      locationId: result.location.id,
-      locationName: result.location.name,
-      checkIn: parsedRequest.checkIn,
-      checkOut: parsedRequest.checkOut,
-      bedsNeeded: parsedRequest.bedsNeeded,
-      originalText: parsedRequest.originalText,
+  invoiceForm.customerName = invoiceForm.customerName || richParsed.billingCompanyName || richParsed.customerName || ''
+  invoiceForm.addressSupplement = invoiceForm.addressSupplement || richParsed.billingAddressSupplement || richParsed.contactName || ''
+  invoiceForm.street = invoiceForm.street || richParsed.billingStreet || ''
+  invoiceForm.zip = invoiceForm.zip || richParsed.billingZip || ''
+  invoiceForm.city = invoiceForm.city || richParsed.billingCity || ''
+  invoiceForm.countryCode = invoiceForm.countryCode || fallbackCountryCode
+  invoiceForm.remark = DEFAULT_INVOICE_REMARK
+
+  return {
+    state: {
+      stage: 'awaiting_create_decision' as const,
+      request: {
+        locationId: result.location.id,
+        locationName: result.location.name,
+        checkIn: parsedRequest.checkIn,
+        checkOut: parsedRequest.checkOut,
+        bedsNeeded: parsedRequest.bedsNeeded,
+        originalText: parsedRequest.originalText,
+      },
+      requestContext: {
+        matchedCustomerId: richParsed.matchedCustomerId,
+        matchedCustomerName: richParsed.matchedCustomerName,
+        contactName: richParsed.contactName,
+        email: richParsed.email,
+        phone: richParsed.phone,
+        billingAddressSupplement: richParsed.billingAddressSupplement,
+        billingStreet: richParsed.billingStreet,
+        billingZip: richParsed.billingZip,
+        billingCity: richParsed.billingCity,
+        billingCountry: richParsed.billingCountry,
+        billingTaxId: richParsed.billingTaxId,
+        project: richParsed.project,
+        reference: richParsed.reference,
+      },
+      invoiceLines,
+      invoiceForm,
+      customerId: matchedCustomer?.id,
+      bookingStatus: 'bestaetigt' as const,
     },
-    invoiceLines,
-    invoiceForm,
-    bookingStatus: 'bestaetigt',
+    reply: availabilityReply,
+  }
+}
+
+async function handleAvailabilityStart(chatId: number | string, text: string): Promise<HandlerResult> {
+  const { state, reply } = await buildConversationStateFromAvailability({ text })
+
+  if (!state.request || (state.stage !== 'awaiting_property_selection' && (!state.invoiceLines || state.invoiceLines.length === 0))) {
+    await resetConversation(chatId)
+    return {
+      handled: true,
+      reply,
+    }
   }
 
   await saveConversation(chatId, state)
 
+  if (state.stage === 'awaiting_property_selection') {
+    return { handled: true, reply }
+  }
+
   return {
     handled: true,
     reply: [
-      availabilityReply,
+      reply,
       '',
       'Willst du für diese Verfügbarkeit eine Buchung bzw. einen Rechnungsentwurf erstellen?',
       'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
@@ -358,7 +600,7 @@ async function selectCustomer(state: TelegramConversationState, query: string) {
   if (matches.length === 0) {
     return {
       state,
-      reply: 'Ich habe keinen passenden Auftraggeber mit Lexoffice-Kontakt-ID gefunden. Wie heißt der Auftraggeber genau?',
+      reply: 'Ich habe keinen passenden Auftraggeber gefunden. Wie heißt der Auftraggeber genau?',
     }
   }
 
@@ -401,11 +643,11 @@ async function selectCustomer(state: TelegramConversationState, query: string) {
   state.invoiceForm = {
     ...invoiceForm,
     customerName: customer.companyName || invoiceForm.customerName,
-    addressSupplement: invoiceForm.addressSupplement || `${customer.firstName ?? ''} ${customer.lastName ?? ''}`.trim(),
-    street: invoiceForm.street || customer.address || '',
-    zip: invoiceForm.zip || customer.zip || '',
-    city: invoiceForm.city || customer.city || '',
-    countryCode: invoiceForm.countryCode || inferCountryCode(customer),
+    addressSupplement: invoiceForm.addressSupplement || `${customer.firstName ?? ''} ${customer.lastName ?? ''}`.trim() || state.requestContext?.billingAddressSupplement || state.requestContext?.contactName || '',
+    street: invoiceForm.street || customer.address || state.requestContext?.billingStreet || '',
+    zip: invoiceForm.zip || customer.zip || state.requestContext?.billingZip || '',
+    city: invoiceForm.city || customer.city || state.requestContext?.billingCity || '',
+    countryCode: invoiceForm.countryCode || inferCountryCodeFromValue(state.requestContext?.billingCountry || customer.country),
   }
   state.stage = 'awaiting_price'
   state.draftInvoice = undefined
@@ -425,9 +667,34 @@ async function createDraftForState(state: TelegramConversationState) {
     throw new Error('Bitte zuerst den Auftraggeber festlegen.')
   }
 
-  const customer = await getCustomerById(state.customerId)
-  if (!customer?.lexofficeContactId) {
-    throw new Error('Der Auftraggeber hat keine Lexoffice-Kontakt-ID.')
+  let customer = await getCustomerById(state.customerId)
+  if (!customer) {
+    throw new Error('Der Auftraggeber konnte nicht geladen werden.')
+  }
+
+  if (!customer.lexofficeContactId) {
+    const fallbackCountryCode = inferCountryCodeFromValue(state.requestContext?.billingCountry || customer.country)
+    const contactNameParts = state.requestContext?.contactName?.trim().split(/\s+/).filter(Boolean) ?? []
+    const firstName = customer.firstName || (contactNameParts.length > 1 ? contactNameParts.slice(0, -1).join(' ') : '')
+    const lastName = customer.lastName || contactNameParts.at(-1) || ''
+
+    const contactPayload = buildLexofficeContactPayload({
+      companyName: state.invoiceForm.customerName || customer.companyName,
+      addressSupplement: state.invoiceForm.addressSupplement,
+      street: state.invoiceForm.street,
+      zip: state.invoiceForm.zip,
+      city: state.invoiceForm.city,
+      countryCode: state.invoiceForm.countryCode || fallbackCountryCode,
+      email: state.requestContext?.email || customer.email,
+      phone: state.requestContext?.phone || customer.phone,
+      firstName,
+      lastName,
+      taxId: customer.taxId || state.requestContext?.billingTaxId,
+      note: `${state.request?.originalText ?? ''}\n${state.requestContext?.project ? `Projekt: ${state.requestContext.project}` : ''}`.trim(),
+    })
+
+    const createdContact = await createContact(contactPayload)
+    customer = await updateCustomerServer(state.customerId, { lexofficeContactId: createdContact.id })
   }
 
   const payload = buildLexofficeInvoicePayload({
@@ -490,6 +757,19 @@ async function createBookingsForState(state: TelegramConversationState) {
 
 async function handleCreateDecision(chatId: number | string, state: TelegramConversationState, text: string): Promise<HandlerResult> {
   if (isYes(text)) {
+    if (state.customerId) {
+      state.stage = 'awaiting_price'
+      await saveConversation(chatId, state)
+      return {
+        handled: true,
+        reply: [
+          `Auftraggeber erkannt: <b>${state.invoiceForm?.customerName ?? state.requestContext?.matchedCustomerName ?? 'Auftraggeber'}</b>`,
+          '',
+          buildBookingPricePrompt(state.invoiceForm!),
+        ].join('\n'),
+      }
+    }
+
     state.stage = 'awaiting_customer'
     await saveConversation(chatId, state)
     return {
@@ -509,6 +789,41 @@ async function handleCreateDecision(chatId: number | string, state: TelegramConv
   return {
     handled: true,
     reply: 'Bitte antworte mit <code>Ja</code> oder <code>Nein</code>. Willst du für diese Verfügbarkeit weiterarbeiten?',
+  }
+}
+
+async function handlePropertySelection(chatId: number | string, state: TelegramConversationState, text: string): Promise<HandlerResult> {
+  const selection = parseNumberFromText(text)
+  if (!selection || !state.propertyChoices || selection < 1 || selection > state.propertyChoices.length || !state.request) {
+    return {
+      handled: true,
+      reply: buildPropertyChoiceReply(state.propertyChoices ?? []),
+    }
+  }
+
+  const choice = state.propertyChoices[selection - 1]
+  const rebuilt = await buildConversationStateFromAvailability({
+    text: state.request.originalText,
+    forcedPropertyId: choice.propertyId,
+  })
+
+  const nextState: TelegramConversationState = {
+    ...rebuilt.state,
+    bookingStatus: state.bookingStatus ?? 'bestaetigt',
+  }
+
+  await saveConversation(chatId, nextState)
+
+  return {
+    handled: true,
+    reply: [
+      rebuilt.reply,
+      '',
+      `Ausgewählt: <b>${choice.shortCode || choice.propertyName}</b>`,
+      '',
+      'Willst du für diese Verfügbarkeit eine Buchung bzw. einen Rechnungsentwurf erstellen?',
+      'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
+    ].join('\n'),
   }
 }
 
@@ -752,6 +1067,10 @@ export async function handleTelegramWorkflowMessage(chatId: number | string, tex
 
   if (state.stage === 'idle') {
     return handleAvailabilityStart(chatId, trimmed)
+  }
+
+  if (state.stage === 'awaiting_property_selection') {
+    return handlePropertySelection(chatId, state, trimmed)
   }
 
   if (state.stage === 'awaiting_create_decision') {

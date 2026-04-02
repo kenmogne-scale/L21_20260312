@@ -25,6 +25,7 @@ import {
   type AllocationStrategy,
   type PropertyAvailability,
 } from '@/lib/availability'
+import { parseBookingRequest, type ParsedBookingRequest } from '@/lib/booking-request-parser'
 import {
   buildLexofficeInvoicePayload,
   createInvoiceDraftLineId,
@@ -71,6 +72,114 @@ type CreatedBookingItem = {
   propertyName: string
   beds: number
   positionNumber: number
+}
+
+const DEFAULT_INVOICE_REMARK = [
+  'Vielen Dank für Ihre Buchung!',
+  '',
+  '***Die Kündigungsfrist beträgt 2 Wochen vor Vertragsende/Mietende. Die Kündigung muss schriftlich erfolgen. Sollte keine Kündigung erfolgen, so verlängert sich das Mietverhältnis automatisch.***',
+].join('\n')
+
+function buildParsedRequestNotes(parsed: ParsedBookingRequest) {
+  return [
+    parsed.contactName ? `Ansprechpartner: ${parsed.contactName}` : '',
+    parsed.email ? `E-Mail: ${parsed.email}` : '',
+    parsed.phone ? `Telefon: ${parsed.phone}` : '',
+    parsed.customerName ? `Auftraggeber laut Anfrage: ${parsed.customerName}` : '',
+    parsed.project ? `Projekt: ${parsed.project}` : '',
+    parsed.reference ? `Referenz: ${parsed.reference}` : '',
+    parsed.objectHint ? `Objekthinweis: ${parsed.objectHint}` : '',
+    parsed.requestedRooms ? `Wunsch: ${parsed.requestedRooms} Zimmer` : '',
+    parsed.billingAddress ? `Billing Address:\n${parsed.billingAddress}` : '',
+    `Originalanfrage:\n${parsed.originalText}`,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+function inferCountryCodeFromParsedRequest(parsed: ParsedBookingRequest | null, fallbackCountryCode: string) {
+  const rawCountry = parsed?.billingCountry?.trim().toLowerCase()
+  if (!rawCountry) {
+    return fallbackCountryCode
+  }
+  if (rawCountry === 'de' || rawCountry === 'deutschland' || rawCountry === 'germany') return 'DE'
+  if (rawCountry === 'norway' || rawCountry === 'norwegen' || rawCountry === 'no') return 'NO'
+  if (rawCountry.length === 2) return rawCountry.toUpperCase()
+  return parsed?.billingCountry?.slice(0, 2).toUpperCase() || fallbackCountryCode
+}
+
+function trimForLexofficeNote(value?: string, maxLength = 1000) {
+  const normalized = value?.trim()
+  if (!normalized) return undefined
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
+}
+
+function buildLexofficeContactPayload(args: {
+  companyName: string
+  addressSupplement?: string
+  street?: string
+  zip?: string
+  city?: string
+  countryCode: string
+  email?: string
+  phone?: string
+  firstName?: string
+  lastName?: string
+  taxId?: string
+  note?: string
+}) {
+  const {
+    companyName,
+    addressSupplement,
+    street,
+    zip,
+    city,
+    countryCode,
+    email,
+    phone,
+    firstName,
+    lastName,
+    taxId,
+    note,
+  } = args
+
+  return {
+    roles: { customer: {} },
+    company: {
+      name: companyName,
+      taxNumber: taxId || undefined,
+      contactPersons: firstName || lastName || email || phone
+        ? [{
+            firstName: firstName || undefined,
+            lastName: lastName || undefined,
+            emailAddress: email || undefined,
+            phoneNumber: phone || undefined,
+            primary: true,
+          }]
+        : undefined,
+    },
+    addresses: {
+      billing: [{
+        supplement: addressSupplement || undefined,
+        street: street || undefined,
+        zip: zip || undefined,
+        city: city || undefined,
+        countryCode,
+      }],
+    },
+    emailAddresses: email ? { business: [email] } : undefined,
+    phoneNumbers: phone ? { business: [phone] } : undefined,
+    note: trimForLexofficeNote(note),
+  }
+}
+
+function isSinglePropertySelected(item: ComputedRequestItem, propertyId: string) {
+  return (
+    item.activeAllocations.length === 1 &&
+    item.activeAllocations[0]?.propertyId === propertyId &&
+    item.totalAllocated === item.bedsNeeded
+  )
 }
 
 function createRequestItem(
@@ -184,7 +293,7 @@ function createInitialInvoiceForm(args: {
     serviceDateTo: serviceDates.at(-1) ?? serviceDates[0] ?? today,
     title: 'Rechnung',
     introduction: customer?.companyName ? `Rechnung für ${customer.companyName}` : 'Rechnung',
-    remark: notes.trim(),
+    remark: DEFAULT_INVOICE_REMARK,
     paymentTermDays: 14,
     totalDiscountPercentage,
     lines,
@@ -264,12 +373,14 @@ function lineTotalsSoFar(
 
 export default function SmartBookingPage() {
   const { properties } = useProperties()
-  const { customers } = useCustomers()
+  const { customers, update: updateCustomer } = useCustomers()
   const { locations } = useLocations()
   const { bookings, add: addBooking } = useBookings()
 
   const [step, setStep] = useState<1 | 2 | 3 | 4 | 5 | 6>(1)
   const [requestItems, setRequestItems] = useState<RequestItemState[]>([createRequestItem()])
+  const [requestText, setRequestText] = useState('')
+  const [parsedRequest, setParsedRequest] = useState<ParsedBookingRequest | null>(null)
   const [customerId, setCustomerId] = useState('')
   const [bookingStatus, setBookingStatus] = useState<'anfrage' | 'option' | 'bestaetigt'>('bestaetigt')
   const [notes, setNotes] = useState('')
@@ -277,6 +388,7 @@ export default function SmartBookingPage() {
   const [vatRate, setVatRate] = useState<0 | 7 | 19>(0)
   const [invoiceForm, setInvoiceForm] = useState<InvoiceFormState | null>(null)
   const [creatingDraft, setCreatingDraft] = useState(false)
+  const [creatingContact, setCreatingContact] = useState(false)
   const [creating, setCreating] = useState(false)
   const [draftInvoice, setDraftInvoice] = useState<DraftInvoiceState | null>(null)
   const [draftError, setDraftError] = useState('')
@@ -379,7 +491,7 @@ export default function SmartBookingPage() {
   const totalAllocated = invoiceLines.reduce((sum, entry) => sum + entry.bedsAllocated, 0)
   const currentCustomer = customers.find(customer => customer.id === customerId)
   const requestDataValid = requestItems.every(item => isValidRequestItem(item))
-  const canCreateDraft = Boolean(currentCustomer?.lexofficeContactId) && Boolean(invoiceForm?.lines.length) && !creatingDraft
+  const canCreateDraft = Boolean(customerId) && Boolean(invoiceForm?.lines.length) && !creatingDraft && !creatingContact
   const canCreateBookings = Boolean(customerId) && invoiceLines.length > 0 && !creating && Boolean(draftInvoice)
   const canContinueToCustomer = invoiceLines.length > 0
   const canContinueToInvoice = Boolean(customerId) && invoiceLines.length > 0
@@ -402,14 +514,14 @@ export default function SmartBookingPage() {
       return {
         ...prev,
         customerName: currentCustomer.companyName || prev.customerName,
-        addressSupplement: prev.addressSupplement || `${currentCustomer.firstName ?? ''} ${currentCustomer.lastName ?? ''}`.trim(),
-        street: prev.street || currentCustomer.address || '',
-        zip: prev.zip || currentCustomer.zip || '',
-        city: prev.city || currentCustomer.city || '',
-        countryCode: prev.countryCode || countryCode,
+        addressSupplement: prev.addressSupplement || `${currentCustomer.firstName ?? ''} ${currentCustomer.lastName ?? ''}`.trim() || parsedRequest?.billingAddressSupplement || parsedRequest?.contactName || '',
+        street: prev.street || currentCustomer.address || parsedRequest?.billingStreet || '',
+        zip: prev.zip || currentCustomer.zip || parsedRequest?.billingZip || '',
+        city: prev.city || currentCustomer.city || parsedRequest?.billingCity || '',
+        countryCode: prev.countryCode || countryCode || inferCountryCodeFromParsedRequest(parsedRequest, countryCode),
       }
     })
-  }, [countryCode, currentCustomer, step])
+  }, [countryCode, currentCustomer, parsedRequest, step])
 
   const updateRequestItem = (requestId: string, updater: (item: RequestItemState) => RequestItemState) => {
     setRequestItems(prev => prev.map(item => (item.id === requestId ? updater(item) : item)))
@@ -488,6 +600,83 @@ export default function SmartBookingPage() {
     }))
   }
 
+  const clearManualAllocations = (requestId: string) => {
+    updateRequestItem(requestId, item => ({
+      ...item,
+      manualAllocations: {},
+    }))
+  }
+
+  const applyExclusivePropertySelection = (
+    requestId: string,
+    propertyId: string,
+    bedsNeeded: number,
+    availabilities: PropertyAvailability[],
+  ) => {
+    updateRequestItem(requestId, item => {
+      const nextManualAllocations = availabilities.reduce<Record<string, number>>((acc, availability) => {
+        acc[availability.propertyId] =
+          availability.propertyId === propertyId
+            ? Math.min(availability.minFreeBeds, bedsNeeded)
+            : 0
+        return acc
+      }, {})
+
+      return {
+        ...item,
+        manualAllocations: nextManualAllocations,
+      }
+    })
+  }
+
+  const handleAnalyzeRequest = () => {
+    const parsed = parseBookingRequest(requestText, {
+      properties,
+      locations,
+      customers,
+    })
+    setParsedRequest(parsed)
+
+    const firstItem = requestItems[0]
+    const scopedProperties = parsed.matchedLocationId
+      ? properties.filter(property => property.locationId === parsed.matchedLocationId)
+      : []
+    const manualPrices = parsed.requestedNetPrice !== undefined
+      ? scopedProperties.reduce<Record<string, number>>((acc, property) => {
+          acc[property.id] = parsed.requestedNetPrice!
+          return acc
+        }, {})
+      : {}
+
+    setRequestItems(prev => prev.map((item, index) => {
+      if (index !== 0) return item
+      return {
+        ...item,
+        locationId: parsed.matchedLocationId ?? item.locationId,
+        checkIn: parsed.checkIn ?? item.checkIn,
+        checkOut: parsed.checkOut ?? item.checkOut,
+        bedsNeeded: parsed.bedsNeeded ?? item.bedsNeeded,
+        manualPrices: Object.keys(manualPrices).length > 0 ? manualPrices : item.manualPrices,
+      }
+    }))
+
+    if (parsed.matchedCustomerId) {
+      setCustomerId(parsed.matchedCustomerId)
+    }
+
+    const parsedNotes = buildParsedRequestNotes(parsed)
+    setNotes(currentNotes => {
+      if (!parsedNotes) return currentNotes
+      if (!currentNotes.trim()) return parsedNotes
+      if (currentNotes.includes(parsed.originalText)) return currentNotes
+      return `${parsedNotes}\n\n${currentNotes}`
+    })
+
+    if (firstItem && parsed.matchedLocationId && parsed.checkIn && parsed.checkOut && parsed.bedsNeeded) {
+      setStep(1)
+    }
+  }
+
   const handleAddRequestItem = (returnToStep1 = false) => {
     setRequestItems(prev => {
       const last = prev.at(-1)
@@ -522,29 +711,79 @@ export default function SmartBookingPage() {
     if (!canContinueToInvoice) return
     setDraftInvoice(null)
     setDraftError('')
-    setInvoiceForm(
-      createInitialInvoiceForm({
-        customer: currentCustomer,
-        invoiceLines,
-        notes,
-        defaultTaxRate: vatRate,
-        totalDiscountPercentage: discountPercent,
-        fallbackCountryCode: countryCode,
-      }),
-    )
+    const fallbackCountryCode = inferCountryCodeFromParsedRequest(parsedRequest, countryCode)
+    const initialForm = createInitialInvoiceForm({
+      customer: currentCustomer,
+      invoiceLines,
+      notes,
+      defaultTaxRate: vatRate,
+      totalDiscountPercentage: discountPercent,
+      fallbackCountryCode,
+    })
+
+    setInvoiceForm({
+      ...initialForm,
+      customerName: initialForm.customerName || parsedRequest?.billingCompanyName || parsedRequest?.customerName || '',
+      addressSupplement: initialForm.addressSupplement || parsedRequest?.billingAddressSupplement || parsedRequest?.contactName || '',
+      street: initialForm.street || parsedRequest?.billingStreet || '',
+      zip: initialForm.zip || parsedRequest?.billingZip || '',
+      city: initialForm.city || parsedRequest?.billingCity || '',
+      countryCode: initialForm.countryCode || fallbackCountryCode,
+    })
     setStep(4)
   }
 
   const handleCreateDraft = async () => {
-    if (!currentCustomer?.lexofficeContactId || !invoiceForm || invoiceForm.lines.length === 0) return
+    if (!currentCustomer || !customerId || !invoiceForm || invoiceForm.lines.length === 0) return
 
     setCreatingDraft(true)
     setDraftError('')
     setDraftInvoice(null)
 
     try {
+      let lexofficeContactId = currentCustomer.lexofficeContactId
+
+      if (!lexofficeContactId) {
+        setCreatingContact(true)
+
+        const contactPayload = buildLexofficeContactPayload({
+          companyName: invoiceForm.customerName || currentCustomer.companyName,
+          addressSupplement: invoiceForm.addressSupplement,
+          street: invoiceForm.street,
+          zip: invoiceForm.zip,
+          city: invoiceForm.city,
+          countryCode: invoiceForm.countryCode || countryCode,
+          email: parsedRequest?.email || currentCustomer.email,
+          phone: parsedRequest?.phone || currentCustomer.phone,
+          firstName: currentCustomer.firstName || parsedRequest?.contactName?.split(' ').slice(0, -1).join(' '),
+          lastName: currentCustomer.lastName || parsedRequest?.contactName?.split(' ').at(-1),
+          taxId: currentCustomer.taxId || parsedRequest?.billingTaxId,
+          note: notes.trim(),
+        })
+
+        const contactRes = await fetch('/api/lexoffice/create-contact', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            customerId,
+            payload: contactPayload,
+          }),
+        })
+
+        const contactData = await contactRes.json()
+        if (!contactRes.ok || !contactData?.ok || !contactData?.id) {
+          throw new Error(contactData?.error || 'Lexoffice-Kontakt konnte nicht erstellt werden.')
+        }
+
+        lexofficeContactId = contactData.id
+        await updateCustomer(customerId, { lexofficeContactId })
+      }
+
       const payload = buildLexofficeInvoicePayload({
-        customer: currentCustomer,
+        customer: {
+          ...currentCustomer,
+          lexofficeContactId,
+        },
         invoiceForm,
         fallbackCountryCode: countryCode,
       })
@@ -589,6 +828,7 @@ export default function SmartBookingPage() {
     } catch (error) {
       setDraftError(error instanceof Error ? error.message : String(error))
     } finally {
+      setCreatingContact(false)
       setCreatingDraft(false)
     }
   }
@@ -663,6 +903,8 @@ export default function SmartBookingPage() {
   const handleReset = () => {
     setStep(1)
     setRequestItems([createRequestItem()])
+    setRequestText('')
+    setParsedRequest(null)
     setCustomerId('')
     setBookingStatus('bestaetigt')
     setNotes('')
@@ -670,6 +912,7 @@ export default function SmartBookingPage() {
     setVatRate(0)
     setInvoiceForm(null)
     setCreatingDraft(false)
+    setCreatingContact(false)
     setCreating(false)
     setDraftInvoice(null)
     setDraftError('')
@@ -724,6 +967,84 @@ export default function SmartBookingPage() {
               <p className="text-sm text-slate-500">
                 Prüfe zuerst nur Standort, Zeitraum und Bettenbedarf. Auftraggeber und Rechnungsdaten kannst du später eintragen.
               </p>
+            </div>
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-4">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Kundenanfrage einfÃ¼gen</p>
+                <p className="text-sm text-slate-500">
+                  Freitext, Mail oder Chatnachricht einfÃ¼gen. Die relevanten Felder werden automatisch erkannt und soweit mÃ¶glich vorbelegt.
+                </p>
+              </div>
+
+              <textarea
+                value={requestText}
+                onChange={event => setRequestText(event.target.value)}
+                rows={10}
+                placeholder="Anfrage hier einfÃ¼gen..."
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg bg-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+              />
+
+              <div className="flex items-center gap-3 flex-wrap">
+                <button
+                  onClick={handleAnalyzeRequest}
+                  disabled={!requestText.trim()}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Search size={16} />
+                  Anfrage analysieren
+                </button>
+                {parsedRequest && (
+                  <span className="text-sm text-slate-500">
+                    Zeitraum, Personen, Standort, Preis und Rechnungsinfos wurden in die Eingabemaske Ã¼bernommen.
+                  </span>
+                )}
+              </div>
+
+              {parsedRequest && (
+                <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
+                  <div className="rounded-lg border border-slate-200 bg-white p-4">
+                    <p className="text-sm font-semibold text-slate-900 mb-3">Erkannt</p>
+                    <div className="grid gap-2 text-sm text-slate-600 md:grid-cols-2">
+                      <p><span className="font-medium text-slate-900">Zeitraum:</span> {parsedRequest.checkIn && parsedRequest.checkOut ? formatRange(parsedRequest.checkIn, parsedRequest.checkOut) : 'nicht erkannt'}</p>
+                      <p><span className="font-medium text-slate-900">Personen:</span> {parsedRequest.bedsNeeded ?? 'nicht erkannt'}</p>
+                      <p><span className="font-medium text-slate-900">Standort:</span> {parsedRequest.matchedLocationName ?? parsedRequest.objectHint ?? 'nicht erkannt'}</p>
+                      <p><span className="font-medium text-slate-900">Preis netto:</span> {parsedRequest.requestedNetPrice !== undefined ? `${parsedRequest.requestedNetPrice} EUR` : 'nicht erkannt'}</p>
+                      <p><span className="font-medium text-slate-900">Auftraggeber:</span> {parsedRequest.matchedCustomerName ?? parsedRequest.customerName ?? 'nicht erkannt'}</p>
+                      <p><span className="font-medium text-slate-900">Ansprechpartner:</span> {parsedRequest.contactName ?? 'nicht erkannt'}</p>
+                      <p><span className="font-medium text-slate-900">E-Mail:</span> {parsedRequest.email ?? 'nicht erkannt'}</p>
+                      <p><span className="font-medium text-slate-900">Telefon:</span> {parsedRequest.phone ?? 'nicht erkannt'}</p>
+                    </div>
+
+                    {parsedRequest.matchedProperties.length > 0 && (
+                      <div className="mt-4">
+                        <p className="text-xs font-medium uppercase tracking-wide text-slate-400 mb-2">Objekt-Treffer</p>
+                        <div className="flex flex-wrap gap-2">
+                          {parsedRequest.matchedProperties.slice(0, 6).map(property => (
+                            <span key={property.id} className="inline-flex items-center rounded-full bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700">
+                              {property.shortCode || property.name}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                    <p className="text-sm font-semibold text-amber-900 mb-2">Gezielt nachfragen</p>
+                    {parsedRequest.clarificationQuestions.length > 0 ? (
+                      <div className="space-y-2">
+                        {parsedRequest.clarificationQuestions.map(question => (
+                          <p key={question} className="text-sm text-amber-800">{question}</p>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm text-amber-800">
+                        Keine offenen Punkte erkannt. Du kannst direkt die VerfÃ¼gbarkeit prÃ¼fen.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -916,10 +1237,63 @@ export default function SmartBookingPage() {
                     </div>
                   </div>
 
+                  {item.effectiveAllocations.filter(allocation => allocation.minFreeBeds >= item.bedsNeeded).length > 1 && (
+                    <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 space-y-3">
+                      <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <div>
+                          <p className="text-sm font-semibold text-blue-900">Wohnung direkt auswÃ¤hlen</p>
+                          <p className="text-sm text-blue-700">
+                            Mehrere Einheiten kÃ¶nnen die komplette Position aufnehmen. Du kannst hier gezielt mit 1, 2, 3 ... die gewÃ¼nschte Wohnung festlegen.
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => clearManualAllocations(item.id)}
+                          className="text-xs font-medium text-blue-700 hover:text-blue-900"
+                        >
+                          Automatik wiederherstellen
+                        </button>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2">
+                        {item.effectiveAllocations
+                          .filter(allocation => allocation.minFreeBeds >= item.bedsNeeded)
+                          .map((allocation, candidateIndex) => {
+                            const selected = isSinglePropertySelected(item, allocation.propertyId)
+                            return (
+                              <button
+                                key={allocation.propertyId}
+                                onClick={() =>
+                                  applyExclusivePropertySelection(
+                                    item.id,
+                                    allocation.propertyId,
+                                    item.bedsNeeded,
+                                    item.availabilities,
+                                  )
+                                }
+                                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition-colors ${
+                                  selected
+                                    ? 'border-blue-600 bg-blue-600 text-white'
+                                    : 'border-blue-200 bg-white text-blue-800 hover:border-blue-300 hover:bg-blue-100'
+                                }`}
+                              >
+                                <span className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${
+                                  selected ? 'bg-white/20 text-white' : 'bg-blue-100 text-blue-700'
+                                }`}>
+                                  {candidateIndex + 1}
+                                </span>
+                                <span>{allocation.shortCode || allocation.propertyName}</span>
+                              </button>
+                            )
+                          })}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="border-b border-slate-200 text-slate-600">
+                          <th className="text-center px-3 py-2.5 font-medium w-14">Nr.</th>
                           <th className="text-left px-4 py-2.5 font-medium">Objekt</th>
                           <th className="text-center px-3 py-2.5 font-medium w-20">Kap.</th>
                           <th className="text-center px-3 py-2.5 font-medium w-16">Frei</th>
@@ -930,7 +1304,7 @@ export default function SmartBookingPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {item.effectiveAllocations.map(allocation => {
+                        {item.effectiveAllocations.map((allocation, allocationIndex) => {
                           const isFull = allocation.minFreeBeds === 0
                           const isAssigned = allocation.bedsAllocated > 0
 
@@ -945,6 +1319,13 @@ export default function SmartBookingPage() {
                                     : 'hover:bg-slate-50'
                               }`}
                             >
+                              <td className="px-3 py-3 text-center">
+                                <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+                                  isAssigned ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'
+                                }`}>
+                                  {allocationIndex + 1}
+                                </span>
+                              </td>
                               <td className="px-4 py-3">
                                 <div className="flex items-center gap-2">
                                   <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: item.locationColor }} />
@@ -1540,7 +1921,7 @@ export default function SmartBookingPage() {
               className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {creatingDraft ? (
-                <span>Entwurf wird erstellt...</span>
+                <span>{creatingContact ? 'Lexoffice-Kontakt wird angelegt...' : 'Entwurf wird erstellt...'}</span>
               ) : (
                 <>
                   <FileText size={16} />
@@ -1554,7 +1935,7 @@ export default function SmartBookingPage() {
             <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
               <AlertTriangle size={16} className="text-amber-600 flex-shrink-0" />
               <p className="text-sm text-amber-800">
-                Für den Auftraggeber ist noch keine Lexoffice-Kontakt-ID hinterlegt. Ohne Verknüpfung kann kein Entwurf erstellt werden.
+                Für den Auftraggeber ist noch keine Lexoffice-Kontakt-ID hinterlegt. Beim Erstellen des Entwurfs wird deshalb zuerst automatisch ein Lexoffice-Kontakt angelegt.
               </p>
             </div>
           )}
