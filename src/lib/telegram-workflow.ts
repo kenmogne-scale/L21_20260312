@@ -4,6 +4,7 @@ import { checkAvailability, loadLocations } from '@/lib/availability-service'
 import { parseAvailabilityMessage } from '@/lib/availability-message-parser'
 import { parseBookingRequest } from '@/lib/booking-request-parser'
 import { createTelegramAvailabilityMessage } from '@/lib/availability-response'
+import { interpretTelegramMessageWithAi, type TelegramAiInterpretation } from '@/lib/telegram-ai-interpreter'
 import {
   addCustomerServer,
   addBookingServer,
@@ -28,7 +29,7 @@ import {
 } from '@/lib/booking-workflow'
 import { createContact, createInvoice, downloadInvoicePdf, getInvoice, type CreateContactPayload } from '@/lib/lexoffice'
 import { supabaseAdmin } from '@/lib/supabase-admin'
-import type { BookingStatus, Customer } from '@/lib/types'
+import type { BookingStatus, Customer, Location, Property } from '@/lib/types'
 
 type TelegramConversationStage =
   | 'idle'
@@ -175,6 +176,132 @@ function inferCountryCodeFromValue(value?: string) {
   if (raw === 'norway' || raw === 'norwegen' || raw === 'no') return 'NO'
   if (raw.length === 2) return raw.toUpperCase()
   return value?.slice(0, 2).toUpperCase() || 'DE'
+}
+
+function findLocationFromAi(ai: TelegramAiInterpretation | null, locations: Location[]) {
+  const locationName = ai?.locationName
+  if (!locationName) return undefined
+
+  const wanted = normalize(locationName)
+  return locations.find(location => {
+    const name = normalize(location.name)
+    const city = normalize(location.city)
+    return wanted === name || wanted === city || name.includes(wanted) || city.includes(wanted) || wanted.includes(name) || wanted.includes(city)
+  })
+}
+
+function findCustomerFromAi(ai: TelegramAiInterpretation | null, customers: Customer[]) {
+  const customerName = ai?.customerName || ai?.billingCompanyName
+  if (!customerName) return undefined
+
+  const wanted = normalize(customerName)
+  const matches = customers
+    .map(customer => {
+      const company = normalize(customer.companyName)
+      const email = normalize(customer.email || '')
+      const score =
+        company === wanted ? 100 :
+        company.includes(wanted) || wanted.includes(company) ? 70 :
+        email && ai?.email && email === normalize(ai.email) ? 95 :
+        0
+
+      return { customer, score }
+    })
+    .filter(entry => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+
+  if (matches.length === 0) return undefined
+  if (matches[0].score >= 95 || matches[0].score - (matches[1]?.score ?? 0) >= 25) {
+    return matches[0].customer
+  }
+
+  return undefined
+}
+
+function findPropertiesFromAi(ai: TelegramAiInterpretation | null, properties: Property[], locations: Location[]) {
+  const propertyHint = ai?.propertyHint
+  if (!propertyHint) return []
+
+  const wanted = normalize(propertyHint)
+  const matches = properties.filter(property => {
+    const location = locations.find(entry => entry.id === property.locationId)
+    const terms = [
+      property.name,
+      property.shortCode,
+      ...property.aliases,
+      location?.name ?? '',
+      location?.city ?? '',
+    ].map(term => normalize(term)).filter(Boolean)
+
+    return terms.some(term => term === wanted || term.includes(wanted) || wanted.includes(term))
+  })
+
+  return matches
+}
+
+function mergeAiIntoParsedRequest(
+  parsed: ReturnType<typeof parseBookingRequest>,
+  ai: TelegramAiInterpretation | null,
+  args: {
+    locations: Location[]
+    properties: Property[]
+    customers: Customer[]
+  },
+): ReturnType<typeof parseBookingRequest> {
+  if (!ai || ai.confidence < 0.45) return parsed
+
+  const aiLocation = findLocationFromAi(ai, args.locations)
+  const aiCustomer = findCustomerFromAi(ai, args.customers)
+  const aiProperties = findPropertiesFromAi(ai, args.properties, args.locations)
+  const locationFromProperty = aiProperties.length === 1
+    ? args.locations.find(location => location.id === aiProperties[0].locationId)
+    : undefined
+
+  return {
+    ...parsed,
+    checkIn: parsed.checkIn ?? ai.checkIn,
+    checkOut: parsed.checkOut ?? ai.checkOut,
+    bedsNeeded: parsed.bedsNeeded ?? ai.bedsNeeded,
+    requestedRooms: parsed.requestedRooms ?? ai.requestedRooms,
+    requestedNetPrice: parsed.requestedNetPrice ?? ai.requestedNetPrice,
+    requestedDiscountPercentage: parsed.requestedDiscountPercentage ?? ai.requestedDiscountPercentage,
+    requestedCleaningFee: parsed.requestedCleaningFee ?? ai.requestedCleaningFee,
+    requestedTaxRate: parsed.requestedTaxRate ?? ai.requestedTaxRate,
+    requestedPaymentTermDays: parsed.requestedPaymentTermDays ?? ai.requestedPaymentTermDays,
+    contactName: parsed.contactName ?? ai.contactName,
+    email: parsed.email ?? ai.email,
+    phone: parsed.phone ?? ai.phone,
+    customerName: parsed.customerName ?? ai.customerName,
+    billingCompanyName: parsed.billingCompanyName ?? ai.billingCompanyName,
+    billingAddressSupplement: parsed.billingAddressSupplement ?? ai.billingAddressSupplement,
+    billingStreet: parsed.billingStreet ?? ai.billingStreet,
+    billingZip: parsed.billingZip ?? ai.billingZip,
+    billingCity: parsed.billingCity ?? ai.billingCity,
+    billingCountry: parsed.billingCountry ?? ai.billingCountry,
+    billingTaxId: parsed.billingTaxId ?? ai.billingTaxId,
+    project: parsed.project ?? ai.project,
+    reference: parsed.reference ?? ai.reference,
+    matchedLocationId: parsed.matchedLocationId ?? aiLocation?.id ?? locationFromProperty?.id,
+    matchedLocationName: parsed.matchedLocationName ?? aiLocation?.name ?? locationFromProperty?.name,
+    matchedCustomerId: parsed.matchedCustomerId ?? aiCustomer?.id,
+    matchedCustomerName: parsed.matchedCustomerName ?? aiCustomer?.companyName,
+    matchedProperties: parsed.matchedProperties.length > 0 ? parsed.matchedProperties : aiProperties,
+    objectHint: parsed.objectHint ?? ai.propertyHint,
+    clarificationQuestions: parsed.clarificationQuestions,
+  }
+}
+
+function getCriticalClarification(ai: TelegramAiInterpretation | null, parsed: ReturnType<typeof parseBookingRequest>) {
+  if (!ai || ai.confidence < 0.5) return undefined
+  if (ai.intent !== 'availability_check' && ai.intent !== 'create_booking') return undefined
+
+  const missing = []
+  if (!parsed.checkIn || !parsed.checkOut) missing.push('Zeitraum')
+  if (!parsed.bedsNeeded) missing.push('Bettenanzahl')
+  if (!parsed.matchedLocationId) missing.push('Standort oder Objekt')
+
+  if (missing.length === 0) return undefined
+  return ai.clarificationQuestion || `Ich habe deine Anfrage verstanden, aber mir fehlt noch: ${missing.join(', ')}. Kannst du das kurz ergänzen?`
 }
 
 function trimForLexofficeNote(value?: string, maxLength = 1000) {
@@ -628,7 +755,28 @@ async function buildConversationStateFromAvailability(args: {
     loadCustomersServer(),
   ])
 
-  const richParsed = parseBookingRequest(text, { properties, locations, customers })
+  let aiInterpretation: TelegramAiInterpretation | null = null
+  if (!forcedPropertyId) {
+    try {
+      aiInterpretation = await interpretTelegramMessageWithAi({ text, locations, properties, customers })
+    } catch (error) {
+      console.warn('Telegram AI interpretation failed, falling back to classic parser:', error)
+    }
+  }
+
+  const classicParsed = parseBookingRequest(text, { properties, locations, customers })
+  const richParsed = mergeAiIntoParsedRequest(classicParsed, aiInterpretation, { properties, locations, customers })
+  const clarificationQuestion = getCriticalClarification(aiInterpretation, richParsed)
+  if (clarificationQuestion) {
+    return {
+      state: defaultState(),
+      reply: [
+        clarificationQuestion,
+        aiInterpretation?.ambiguities.length ? ['', `Unsicher bin ich bei: ${aiInterpretation.ambiguities.join('; ')}`].join('\n') : '',
+      ].filter(Boolean).join('\n'),
+    }
+  }
+
   const parsedRequest =
     richParsed.checkIn && richParsed.checkOut && richParsed.bedsNeeded && richParsed.matchedLocationId
       ? {
