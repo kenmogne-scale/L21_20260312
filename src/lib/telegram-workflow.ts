@@ -33,6 +33,7 @@ import type { BookingStatus, Customer, Location, Property } from '@/lib/types'
 
 type TelegramConversationStage =
   | 'idle'
+  | 'awaiting_availability_details'
   | 'awaiting_property_selection'
   | 'awaiting_create_decision'
   | 'awaiting_customer'
@@ -53,6 +54,17 @@ type TelegramDraftRequest = {
   checkOut: string
   bedsNeeded: number
   originalText: string
+}
+
+type TelegramPendingAvailability = {
+  messages: string[]
+  checkIn?: string
+  checkOut?: string
+  bedsNeeded?: number
+  locationName?: string
+  locationId?: string
+  propertyHint?: string
+  clarificationQuestion?: string
 }
 
 type TelegramPropertyChoice = {
@@ -91,6 +103,7 @@ type TelegramRequestContext = {
 type TelegramConversationState = {
   stage: TelegramConversationStage
   request?: TelegramDraftRequest
+  pendingAvailability?: TelegramPendingAvailability
   requestContext?: TelegramRequestContext
   invoiceLines?: InvoiceLineItem[]
   invoiceForm?: InvoiceFormState
@@ -302,6 +315,34 @@ function getCriticalClarification(ai: TelegramAiInterpretation | null, parsed: R
 
   if (missing.length === 0) return undefined
   return ai.clarificationQuestion || `Ich habe deine Anfrage verstanden, aber mir fehlt noch: ${missing.join(', ')}. Kannst du das kurz ergänzen?`
+}
+
+function buildPendingAvailabilityState(args: {
+  text: string
+  parsed: ReturnType<typeof parseBookingRequest>
+  ai: TelegramAiInterpretation | null
+  clarificationQuestion: string
+}): TelegramConversationState {
+  const { text, parsed, ai, clarificationQuestion } = args
+  return {
+    ...defaultState(),
+    stage: 'awaiting_availability_details',
+    pendingAvailability: {
+      messages: [text],
+      checkIn: parsed.checkIn ?? ai?.checkIn,
+      checkOut: parsed.checkOut ?? ai?.checkOut,
+      bedsNeeded: parsed.bedsNeeded ?? ai?.bedsNeeded,
+      locationName: parsed.matchedLocationName ?? ai?.locationName,
+      locationId: parsed.matchedLocationId,
+      propertyHint: parsed.objectHint ?? ai?.propertyHint,
+      clarificationQuestion,
+    },
+  }
+}
+
+function buildCombinedAvailabilityText(state: TelegramConversationState, text: string) {
+  const previousMessages = state.pendingAvailability?.messages ?? []
+  return [...previousMessages, text].filter(Boolean).join('\n')
 }
 
 function trimForLexofficeNote(value?: string, maxLength = 1000) {
@@ -769,7 +810,12 @@ async function buildConversationStateFromAvailability(args: {
   const clarificationQuestion = getCriticalClarification(aiInterpretation, richParsed)
   if (clarificationQuestion) {
     return {
-      state: defaultState(),
+      state: buildPendingAvailabilityState({
+        text,
+        parsed: richParsed,
+        ai: aiInterpretation,
+        clarificationQuestion,
+      }),
       reply: [
         clarificationQuestion,
         aiInterpretation?.ambiguities.length ? ['', `Unsicher bin ich bei: ${aiInterpretation.ambiguities.join('; ')}`].join('\n') : '',
@@ -985,6 +1031,11 @@ async function buildConversationStateFromAvailability(args: {
 
 async function handleAvailabilityStart(chatId: number | string, text: string): Promise<HandlerResult> {
   const { state, reply } = await buildConversationStateFromAvailability({ text })
+
+  if (state.stage === 'awaiting_availability_details') {
+    await saveConversation(chatId, state)
+    return { handled: true, reply }
+  }
 
   if (!state.request || (state.stage !== 'awaiting_property_selection' && (!state.invoiceLines || state.invoiceLines.length === 0))) {
     await resetConversation(chatId)
@@ -1316,6 +1367,44 @@ async function handlePropertySelection(chatId: number | string, state: TelegramC
   }
 }
 
+async function handleAvailabilityDetails(chatId: number | string, state: TelegramConversationState, text: string): Promise<HandlerResult> {
+  const combinedText = buildCombinedAvailabilityText(state, text)
+  const result = await buildConversationStateFromAvailability({ text: combinedText })
+
+  if (result.state.stage === 'awaiting_availability_details') {
+    result.state.pendingAvailability = {
+      ...result.state.pendingAvailability,
+      messages: [...(state.pendingAvailability?.messages ?? []), text],
+    }
+    await saveConversation(chatId, result.state)
+    return { handled: true, reply: result.reply }
+  }
+
+  if (!result.state.request || (result.state.stage !== 'awaiting_property_selection' && (!result.state.invoiceLines || result.state.invoiceLines.length === 0))) {
+    await resetConversation(chatId)
+    return {
+      handled: true,
+      reply: result.reply,
+    }
+  }
+
+  await saveConversation(chatId, result.state)
+
+  if (result.state.stage === 'awaiting_property_selection') {
+    return { handled: true, reply: result.reply }
+  }
+
+  return {
+    handled: true,
+    reply: [
+      result.reply,
+      '',
+      'Willst du fuer diese Verfuegbarkeit eine Buchung bzw. einen Rechnungsentwurf erstellen?',
+      'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
+    ].join('\n'),
+  }
+}
+
 async function handlePriceStep(chatId: number | string, state: TelegramConversationState, text: string): Promise<HandlerResult> {
   if (!state.invoiceForm) {
     throw new Error('Es gibt noch keinen aktiven Vorgang.')
@@ -1567,6 +1656,10 @@ export async function handleTelegramWorkflowMessage(chatId: number | string, tex
       handled: true,
       reply: formatInvoiceFormSummary(state, customer),
     }
+  }
+
+  if (state.stage === 'awaiting_availability_details') {
+    return handleAvailabilityDetails(chatId, state, trimmed)
   }
 
   if (looksLikeAvailabilityRequest(trimmed)) {
