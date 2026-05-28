@@ -37,6 +37,7 @@ import {
 } from '@/lib/booking-workflow'
 import { createContact, createInvoice, downloadInvoicePdf, getInvoice, type CreateContactPayload } from '@/lib/lexoffice'
 import { supabaseAdmin } from '@/lib/supabase-admin'
+import { escapeHtml, type InlineKeyboard } from '@/lib/telegram'
 import type { BookingStatus, Customer, Location, Property } from '@/lib/types'
 
 type TelegramConversationStage =
@@ -144,6 +145,7 @@ type ConversationRow = {
 type HandlerResult = {
   reply: string
   handled: boolean
+  replyMarkup?: InlineKeyboard
   document?: {
     fileName: string
     contentType: string
@@ -201,6 +203,64 @@ function parseNumberFromText(value: string): number | null {
 function formatMoney(value: number) {
   return `${value.toFixed(2)} EUR`
 }
+
+// ─── Inline Keyboard Builders ───────────────────────────────────────────────
+
+function yesNoKeyboard(yesLabel = 'Ja ✓', noLabel = 'Nein ✗'): InlineKeyboard {
+  return { inline_keyboard: [[
+    { text: yesLabel, callback_data: 'confirm_yes' },
+    { text: noLabel, callback_data: 'confirm_no' },
+  ]] }
+}
+
+function taxRateKeyboard(): InlineKeyboard {
+  return { inline_keyboard: [[
+    { text: '0%', callback_data: 'tax_0' },
+    { text: '7%', callback_data: 'tax_7' },
+    { text: '19%', callback_data: 'tax_19' },
+  ]] }
+}
+
+function discountKeyboard(): InlineKeyboard {
+  return { inline_keyboard: [[
+    { text: 'Kein Rabatt', callback_data: 'discount_0' },
+    { text: '5%', callback_data: 'discount_5' },
+    { text: '10%', callback_data: 'discount_10' },
+  ]] }
+}
+
+function propertyChoiceKeyboard(choices: TelegramPropertyChoice[]): InlineKeyboard {
+  return { inline_keyboard: choices.map((choice, i) => ([{
+    text: `${choice.shortCode || choice.propertyName} · ${choice.freeBeds} frei`,
+    callback_data: `property_${i + 1}`,
+  }])) }
+}
+
+function paymentTermKeyboard(): InlineKeyboard {
+  return { inline_keyboard: [[
+    { text: '7 Tage', callback_data: 'payterm_7' },
+    { text: '14 Tage', callback_data: 'payterm_14' },
+    { text: '30 Tage', callback_data: 'payterm_30' },
+  ]] }
+}
+
+function cleaningKeyboard(): InlineKeyboard {
+  return { inline_keyboard: [[
+    { text: 'Keine', callback_data: 'cleaning_0' },
+    { text: '45 EUR', callback_data: 'cleaning_45' },
+    { text: '80 EUR', callback_data: 'cleaning_80' },
+    { text: '150 EUR', callback_data: 'cleaning_150' },
+  ]] }
+}
+
+function extensionBookingKeyboard(candidateCount: number): InlineKeyboard {
+  return { inline_keyboard: Array.from({ length: candidateCount }, (_, i) => ([{
+    text: `Buchung ${i + 1}`,
+    callback_data: `property_${i + 1}`,
+  }])) }
+}
+
+// ─── Country Code ───────────────────────────────────────────────────────────
 
 function inferCountryCodeFromValue(value?: string) {
   const raw = value?.trim().toLowerCase()
@@ -736,6 +796,7 @@ async function moveToNextRequiredStep(chatId: number | string, state: TelegramCo
     return {
       handled: true,
       reply: 'Soll ein Rabatt berücksichtigt werden? Antworte mit einer Zahl wie <code>5</code> oder mit <code>nein</code>.',
+      replyMarkup: discountKeyboard(),
     }
   }
 
@@ -746,6 +807,7 @@ async function moveToNextRequiredStep(chatId: number | string, state: TelegramCo
     return {
       handled: true,
       reply: buildCleaningPrompt(state.invoiceForm),
+      replyMarkup: cleaningKeyboard(),
     }
   }
 
@@ -755,6 +817,7 @@ async function moveToNextRequiredStep(chatId: number | string, state: TelegramCo
     return {
       handled: true,
       reply: buildTaxRatePrompt(state.invoiceForm),
+      replyMarkup: taxRateKeyboard(),
     }
   }
 
@@ -764,6 +827,7 @@ async function moveToNextRequiredStep(chatId: number | string, state: TelegramCo
     return {
       handled: true,
       reply: 'Welches Zahlungsziel soll gelten? Antworte z. B. mit <code>14</code> für 14 Tage.',
+      replyMarkup: paymentTermKeyboard(),
     }
   }
 
@@ -774,6 +838,7 @@ async function moveToNextRequiredStep(chatId: number | string, state: TelegramCo
   return {
     handled: true,
     reply: buildDraftConfirmationReply(state, customer),
+    replyMarkup: yesNoKeyboard('Entwurf erstellen ✓', 'Abbrechen ✗'),
   }
 }
 
@@ -954,6 +1019,7 @@ async function buildConversationStateFromAvailability(args: {
         bookingStatus: 'bestaetigt' as const,
       },
       reply: [availabilityReply, '', buildPropertyChoiceReply(propertyChoices)].join('\n'),
+      replyMarkup: propertyChoiceKeyboard(propertyChoices),
     }
   }
 
@@ -1087,35 +1153,35 @@ async function buildConversationStateFromAvailability(args: {
 }
 
 async function handleAvailabilityStart(chatId: number | string, text: string): Promise<HandlerResult> {
-  const { state, reply } = await buildConversationStateFromAvailability({ text })
+  const result = await buildConversationStateFromAvailability({ text })
 
-  if (state.stage === 'awaiting_availability_details') {
-    await saveConversation(chatId, state)
-    return { handled: true, reply }
+  if (result.state.stage === 'awaiting_availability_details') {
+    await saveConversation(chatId, result.state)
+    return { handled: true, reply: result.reply }
   }
 
-  if (!state.request || (state.stage !== 'awaiting_property_selection' && (!state.invoiceLines || state.invoiceLines.length === 0))) {
+  if (!result.state.request || (result.state.stage !== 'awaiting_property_selection' && (!result.state.invoiceLines || result.state.invoiceLines.length === 0))) {
     await resetConversation(chatId)
     return {
       handled: true,
-      reply,
+      reply: result.reply,
     }
   }
 
-  await saveConversation(chatId, state)
+  await saveConversation(chatId, result.state)
 
-  if (state.stage === 'awaiting_property_selection') {
-    return { handled: true, reply }
+  if (result.state.stage === 'awaiting_property_selection') {
+    return { handled: true, reply: result.reply, replyMarkup: result.replyMarkup }
   }
 
   return {
     handled: true,
     reply: [
-      reply,
+      result.reply,
       '',
       'Willst du für diese Verfügbarkeit eine Buchung bzw. einen Rechnungsentwurf erstellen?',
-      'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
     ].join('\n'),
+    replyMarkup: yesNoKeyboard(),
   }
 }
 
@@ -1156,7 +1222,7 @@ async function selectCustomer(state: TelegramConversationState, query: string) {
 
       return {
         state,
-        reply: `Auftraggeber neu angelegt: <b>${createdCustomer.companyName}</b>`,
+        reply: `Auftraggeber neu angelegt: <b>${escapeHtml(createdCustomer.companyName)}</b>`,
       }
     }
 
@@ -1215,7 +1281,7 @@ async function selectCustomer(state: TelegramConversationState, query: string) {
 
   return {
     state,
-    reply: `Auftraggeber gesetzt: <b>${customer.companyName}</b>`,
+    reply: `Auftraggeber gesetzt: <b>${escapeHtml(customer.companyName)}</b>`,
   }
 }
 
@@ -1319,7 +1385,7 @@ async function handleCreateDecision(chatId: number | string, state: TelegramConv
       return {
         ...next,
         reply: [
-          `Auftraggeber erkannt: <b>${state.invoiceForm?.customerName ?? state.requestContext?.matchedCustomerName ?? 'Auftraggeber'}</b>`,
+          `Auftraggeber erkannt: <b>${escapeHtml(state.invoiceForm?.customerName ?? state.requestContext?.matchedCustomerName ?? 'Auftraggeber')}</b>`,
           '',
           next.reply,
         ].join('\n'),
@@ -1385,7 +1451,8 @@ async function handleCreateDecision(chatId: number | string, state: TelegramConv
 
   return {
     handled: true,
-    reply: 'Bitte antworte mit <code>Ja</code> oder <code>Nein</code>. Willst du für diese Verfügbarkeit weiterarbeiten?',
+    reply: 'Willst du für diese Verfügbarkeit weiterarbeiten?',
+    replyMarkup: yesNoKeyboard(),
   }
 }
 
@@ -1395,6 +1462,7 @@ async function handlePropertySelection(chatId: number | string, state: TelegramC
     return {
       handled: true,
       reply: buildPropertyChoiceReply(state.propertyChoices ?? []),
+      replyMarkup: propertyChoiceKeyboard(state.propertyChoices ?? []),
     }
   }
 
@@ -1423,11 +1491,11 @@ async function handlePropertySelection(chatId: number | string, state: TelegramC
     reply: [
       rebuilt.reply,
       '',
-      `Ausgewählt: <b>${choice.shortCode || choice.propertyName}</b>`,
+      `Ausgewählt: <b>${escapeHtml(choice.shortCode || choice.propertyName)}</b>`,
       '',
       'Willst du für diese Verfügbarkeit eine Buchung bzw. einen Rechnungsentwurf erstellen?',
-      'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
     ].join('\n'),
+    replyMarkup: yesNoKeyboard(),
   }
 }
 
@@ -1455,7 +1523,7 @@ async function handleAvailabilityDetails(chatId: number | string, state: Telegra
   await saveConversation(chatId, result.state)
 
   if (result.state.stage === 'awaiting_property_selection') {
-    return { handled: true, reply: result.reply }
+    return { handled: true, reply: result.reply, replyMarkup: result.replyMarkup }
   }
 
   return {
@@ -1463,9 +1531,9 @@ async function handleAvailabilityDetails(chatId: number | string, state: Telegra
     reply: [
       result.reply,
       '',
-      'Willst du fuer diese Verfuegbarkeit eine Buchung bzw. einen Rechnungsentwurf erstellen?',
-      'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
+      'Willst du für diese Verfügbarkeit eine Buchung bzw. einen Rechnungsentwurf erstellen?',
     ].join('\n'),
+    replyMarkup: yesNoKeyboard(),
   }
 }
 
@@ -1509,6 +1577,7 @@ async function handleDiscountStep(chatId: number | string, state: TelegramConver
       return {
         handled: true,
         reply: 'Bitte antworte mit einem Rabatt in Prozent wie <code>5</code> oder mit <code>nein</code>.',
+        replyMarkup: discountKeyboard(),
       }
     }
     state.invoiceForm.totalDiscountPercentage = amount
@@ -1532,6 +1601,7 @@ async function handleCleaningStep(chatId: number | string, state: TelegramConver
       return {
         handled: true,
         reply: buildCleaningPrompt(state.invoiceForm),
+        replyMarkup: cleaningKeyboard(),
       }
     }
 
@@ -1547,12 +1617,6 @@ async function handleCleaningStep(chatId: number | string, state: TelegramConver
   }
 
   return moveToNextRequiredStep(chatId, state)
-  state.stage = 'awaiting_tax_rate'
-  await saveConversation(chatId, state)
-  return {
-    handled: true,
-    reply: buildTaxRatePrompt(state.invoiceForm!),
-  }
 }
 
 async function handleTaxRateStep(chatId: number | string, state: TelegramConversationState, text: string): Promise<HandlerResult> {
@@ -1565,6 +1629,7 @@ async function handleTaxRateStep(chatId: number | string, state: TelegramConvers
     return {
       handled: true,
       reply: buildTaxRatePrompt(state.invoiceForm),
+      replyMarkup: taxRateKeyboard(),
     }
   }
 
@@ -1586,6 +1651,7 @@ async function handlePaymentTermStep(chatId: number | string, state: TelegramCon
     return {
       handled: true,
       reply: 'Bitte antworte mit einer Anzahl Tagen, z. B. <code>14</code>.',
+      replyMarkup: paymentTermKeyboard(),
     }
   }
 
@@ -1605,8 +1671,8 @@ async function handlePaymentTermStep(chatId: number | string, state: TelegramCon
       formatInvoiceFormSummary(state, customer),
       '',
       'Soll ich den Lexoffice-Entwurf jetzt erstellen?',
-      'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
     ].join('\n'),
+    replyMarkup: yesNoKeyboard('Entwurf erstellen ✓', 'Abbrechen ✗'),
   }
 }
 
@@ -1623,7 +1689,8 @@ async function handleDraftConfirmationStep(chatId: number | string, state: Teleg
   if (!isYes(text)) {
     return {
       handled: true,
-      reply: 'Bitte antworte mit <code>Ja</code> oder <code>Nein</code>. Soll ich den Lexoffice-Entwurf jetzt erstellen?',
+      reply: 'Soll ich den Lexoffice-Entwurf jetzt erstellen?',
+      replyMarkup: yesNoKeyboard('Entwurf erstellen ✓', 'Abbrechen ✗'),
     }
   }
 
@@ -1654,8 +1721,8 @@ async function handleDraftConfirmationStep(chatId: number | string, state: Teleg
       document ? 'Ich schicke dir die PDF direkt hier in Telegram.' : 'Die PDF konnte ich noch nicht direkt anhängen. Nutze vorerst den Lexoffice-Link.',
       '',
       'Soll ich jetzt auch die Buchungen anlegen?',
-      'Antworte mit <code>Ja</code> oder <code>Nein</code>.',
     ].filter(Boolean).join('\n'),
+    replyMarkup: yesNoKeyboard('Buchungen anlegen ✓', 'Nur Entwurf'),
     document,
   }
 }
@@ -1673,7 +1740,8 @@ async function handleBookingConfirmationStep(chatId: number | string, state: Tel
   if (!isYes(text)) {
     return {
       handled: true,
-      reply: 'Bitte antworte mit <code>Ja</code> oder <code>Nein</code>. Soll ich jetzt auch die Buchungen anlegen?',
+      reply: 'Soll ich jetzt auch die Buchungen anlegen?',
+      replyMarkup: yesNoKeyboard('Buchungen anlegen ✓', 'Nur Entwurf'),
     }
   }
 
@@ -1750,7 +1818,7 @@ async function handleExtensionStart(
     await resetConversation(chatId)
     return {
       handled: true,
-      reply: `Keine aktive Buchung für "${customerQuery}" gefunden. Prüfe den Kundennamen oder ob die Buchung den Status "bestätigt" hat.`,
+      reply: `Keine aktive Buchung für "${escapeHtml(customerQuery)}" gefunden. Prüfe den Kundennamen oder ob die Buchung den Status "bestätigt" hat.`,
     }
   }
 
@@ -1799,7 +1867,7 @@ async function handleExtensionStart(
         },
       })
 
-      return { handled: true, reply: confirmMessage }
+      return { handled: true, reply: confirmMessage, replyMarkup: yesNoKeyboard('Verlängern ✓', 'Abbrechen ✗') }
     } catch (error) {
       await resetConversation(chatId)
       return {
@@ -1811,7 +1879,7 @@ async function handleExtensionStart(
 
   // Multiple matches — ask which one
   const bookingSummary = candidates.map((c, i) =>
-    `${i + 1}. ${c.customer.companyName} — ${c.property.shortCode || c.property.name} (${formatRange(c.booking.checkIn, c.booking.checkOut)}, ${c.booking.bedsBooked} Betten)`,
+    `${i + 1}. ${escapeHtml(c.customer.companyName)} — ${escapeHtml(c.property.shortCode || c.property.name)} (${formatRange(c.booking.checkIn, c.booking.checkOut)}, ${c.booking.bedsBooked} Betten)`,
   ).join('\n')
 
   await saveConversation(chatId, {
@@ -1828,11 +1896,12 @@ async function handleExtensionStart(
   return {
     handled: true,
     reply: [
-      `Mehrere aktive Buchungen für "${customerQuery}" gefunden:`,
+      `Mehrere aktive Buchungen für "${escapeHtml(customerQuery)}" gefunden:`,
       bookingSummary,
       '',
       'Welche Buchung soll verlängert werden? Antworte mit der Nummer.',
     ].join('\n'),
+    replyMarkup: extensionBookingKeyboard(candidates.length),
   }
 }
 
@@ -1915,7 +1984,7 @@ async function handleExtendBookingSelection(
       state.stage = 'awaiting_extend_confirmation'
       state.extension.candidateIndex = selectionIndex
       await saveConversation(chatId, state)
-      return { handled: true, reply: confirmMessage }
+      return { handled: true, reply: confirmMessage, replyMarkup: yesNoKeyboard('Verlängern ✓', 'Abbrechen ✗') }
     } catch (error) {
       await resetConversation(chatId)
       return {
@@ -1930,6 +1999,7 @@ async function handleExtendBookingSelection(
     return {
       handled: true,
       reply: 'Welche Buchung soll verlängert werden? Antworte mit der Nummer.',
+      replyMarkup: extensionBookingKeyboard(candidateIds.length),
     }
   }
 
@@ -1947,7 +2017,7 @@ async function handleExtendBookingSelection(
       const confirmMessage = formatExtensionConfirmation(candidate, state.extension.newCheckOut)
       state.stage = 'awaiting_extend_confirmation'
       await saveConversation(chatId, state)
-      return { handled: true, reply: confirmMessage }
+      return { handled: true, reply: confirmMessage, replyMarkup: yesNoKeyboard('Verlängern ✓', 'Abbrechen ✗') }
     } catch (error) {
       await resetConversation(chatId)
       return {
@@ -1988,7 +2058,8 @@ async function handleExtendConfirmation(
   if (!isYes(text)) {
     return {
       handled: true,
-      reply: 'Bitte antworte mit <code>Ja</code> oder <code>Nein</code>.',
+      reply: 'Soll die Verlängerung durchgeführt werden?',
+      replyMarkup: yesNoKeyboard('Verlängern ✓', 'Abbrechen ✗'),
     }
   }
 

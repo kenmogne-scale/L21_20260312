@@ -10,9 +10,34 @@ function getTelegramApiUrl(method: string) {
   return `https://api.telegram.org/bot${telegramToken}/${method}`
 }
 
-export async function sendTelegramMessage(chatId: number | string, text: string) {
+// ─── Inline Keyboard Types ──────────────────────────────────────────────────
+
+export type InlineKeyboardButton = {
+  text: string
+  callback_data: string
+}
+
+export type InlineKeyboard = {
+  inline_keyboard: InlineKeyboardButton[][]
+}
+
+// ─── HTML Helpers ───────────────────────────────────────────────────────────
+
+export function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+// ─── Send Message ───────────────────────────────────────────────────────────
+
+export async function sendTelegramMessage(
+  chatId: number | string,
+  text: string,
+  replyMarkup?: InlineKeyboard,
+) {
   const normalizedText = String(text ?? '')
-    .replace(/<[^>]+>/g, '')
     .replace(/\u0000/g, '')
     .trim()
     .slice(0, 4000)
@@ -25,7 +50,9 @@ export async function sendTelegramMessage(chatId: number | string, text: string)
     body: JSON.stringify({
       chat_id: String(chatId),
       text: normalizedText,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     }),
   })
 
@@ -36,6 +63,28 @@ export async function sendTelegramMessage(chatId: number | string, text: string)
 
   return response.json()
 }
+
+// ─── Answer Callback Query ──────────────────────────────────────────────────
+
+export async function answerCallbackQuery(callbackQueryId: string, text?: string) {
+  const response = await fetch(getTelegramApiUrl('answerCallbackQuery'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+      ...(text ? { text } : {}),
+    }),
+  })
+
+  if (!response.ok) {
+    const body = await response.text()
+    console.error(`Telegram answerCallbackQuery fehlgeschlagen: ${response.status} ${body}`)
+  }
+}
+
+// ─── Send Document ──────────────────────────────────────────────────────────
 
 export async function sendTelegramDocument(args: {
   chatId: number | string
